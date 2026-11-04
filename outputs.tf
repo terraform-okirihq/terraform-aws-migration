@@ -46,7 +46,8 @@ locals {
     local.private_link ? "Files: DataSync uses PrivateLink. When generating an activation key on the agent console, choose 'VPC endpoint' and enter ${try(data.aws_network_interface.datasync_endpoint[0].private_ip, "")}." : "",
     local.has.files && length(local.dest_fsx) > 0 ? "Files: allow security group ${try(aws_security_group.datasync[0].id, "")} on your FSx for Windows security group (SMB 445)." : "",
     local.has.files && length(local.dest_efs) > length(local.dest_efs_plat) ? "Files: allow security group ${try(aws_security_group.datasync[0].id, "")} on your EFS mount-target security group (NFS 2049)." : "",
-    local.has.servers ? "Servers: run setup.1 and setup.2 once, then on each server get credentials with setup.3 and run its install command." : "",
+    local.has.servers && !var.servers.automate ? "Servers: run setup.1 and setup.2 once (or set servers.automate = true), then on each server get credentials with setup.3 and run its install command." : "",
+    local.has.servers && var.servers.automate ? "Servers: MGN setup is applied automatically. On each server get credentials with setup.3, run its install command, then terraform apply again to apply licensing." : "",
   ])
 }
 
@@ -122,4 +123,9 @@ output "alerts_topic_arn" {
 output "kms_key_arn" {
   description = "KMS key used for migration data (null = AWS-managed keys)."
   value       = local.kms_key_arn
+}
+
+output "mgn_setup_script" {
+  description = "The idempotent MGN setup script (what servers.automate runs). Run it yourself, or in CI, if you prefer."
+  value       = local.servers_on ? (var.servers.automate ? local.mgn_script : "Set servers.automate = true to generate the setup script; until then use summary.servers.setup.") : null
 }

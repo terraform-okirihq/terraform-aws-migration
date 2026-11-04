@@ -296,6 +296,35 @@ run "kerberos_needs_principal" {
   expect_failures = [terraform_data.guardrails]
 }
 
+run "servers_automation_script" {
+  command = plan
+
+  # Plan only: the script is rendered and checked, never executed.
+  override_resource {
+    target          = aws_security_group.mgn_replication[0]
+    override_during = plan
+    values          = { id = "sg-0mgnreplication000" }
+  }
+
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    servers = {
+      automate  = true
+      inventory = { web01 = { os = "windows", licensing = "byol" }, app01 = { os = "rhel" }, api01 = { os = "ubuntu" } }
+    }
+  }
+
+  assert {
+    condition     = length(terraform_data.mgn_setup) == 1
+    error_message = "automate = true should schedule the MGN setup"
+  }
+  assert {
+    condition     = strcontains(output.mgn_setup_script, "sg-0mgnreplication000") && strcontains(output.mgn_setup_script, "hostname=='web01'") && strcontains(output.mgn_setup_script, "osByol=true") && !strcontains(output.mgn_setup_script, "hostname=='api01'")
+    error_message = "script must use the replication SG and set licensing only for windows/rhel/suse servers"
+  }
+}
+
 # ---------------------------------------------------------------- guardrails refuse bad input
 
 run "refuses_unencrypted_database" {

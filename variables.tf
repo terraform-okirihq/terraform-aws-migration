@@ -300,8 +300,11 @@ variable "servers" {
     })), {})
     staging_subnet_id         = optional(string) # default: first target private subnet
     replication_instance_type = optional(string, "t3.small")
-    use_private_ip            = optional(bool, true) # replicate over VPN / Direct Connect, not the internet
-    bandwidth_mbps            = optional(number, 0)  # 0 = no throttling
+    use_private_ip            = optional(bool, true)        # replicate over VPN / Direct Connect, not the internet
+    bandwidth_mbps            = optional(number, 0)         # 0 = no throttling
+    automate                  = optional(bool, false)       # run the MGN setup with the AWS CLI during apply (needs bash + aws CLI)
+    launch_disposition        = optional(string, "STOPPED") # STOPPED | STARTED: state of test/cutover instances at launch
+    right_sizing              = optional(string, "BASIC")   # BASIC | NONE: pick the EC2 type from source CPU/RAM
   })
   default = {}
 
@@ -310,6 +313,11 @@ variable "servers" {
       ["windows", "rhel", "centos", "rocky", "alma", "oracle-linux", "ubuntu", "debian", "suse", "amazon-linux"], s.os
     )])
     error_message = "servers.inventory.*.os must be one of: windows, rhel, centos, rocky, alma, oracle-linux, ubuntu, debian, suse, amazon-linux."
+  }
+
+  validation {
+    condition     = contains(["STOPPED", "STARTED"], var.servers.launch_disposition) && contains(["BASIC", "NONE"], var.servers.right_sizing)
+    error_message = "servers.launch_disposition must be STOPPED or STARTED; servers.right_sizing must be BASIC or NONE."
   }
 
   validation {

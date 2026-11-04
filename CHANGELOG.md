@@ -2,6 +2,12 @@
 
 ## 0.2.0
 
+- **Landing network:** `network.create` builds a VPC (2-4 AZs, NAT none / single / per AZ, gateway and optional
+  interface endpoints, flow logs, locked default SG); `vpn` adds a Site-to-Site VPN on a VGW or Transit Gateway
+  (new or existing) with strong IKEv2 ciphers, tunnel logs, static or BGP routing and a tunnel-down alarm; `dns`
+  adds Route 53 Resolver forwarding to on-prem DNS and an inbound endpoint. Works with existing VPCs and the
+  platform module too.
+
 - **Files:** Kerberos for HDFS (principal, keytab, krb5.conf, QOP); `s3` source for buckets in another account or
   region (agentless, with the bucket policy to hand the source owner); `azure-blob` source.
 - **Servers:** `servers.automate = true` applies the MGN setup during apply (service init, replication and launch

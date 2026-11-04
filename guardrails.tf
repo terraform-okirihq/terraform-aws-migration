@@ -14,13 +14,34 @@ resource "terraform_data" "guardrails" {
   lifecycle {
     # ---------------------------------------------------------- target
     precondition {
-      condition     = (try(var.target.platform_name, null) != null) != (try(var.target.vpc_id, null) != null)
-      error_message = "Set exactly one of target.platform_name (to reuse the platform module's VPC) or target.vpc_id + target.subnet_ids."
+      condition     = length([for x in [try(var.target.platform_name, null) != null, try(var.target.vpc_id, null) != null, var.network.create] : x if x]) == 1
+      error_message = "Choose exactly one landing network: target.platform_name (platform module), target.vpc_id + subnet_ids (existing VPC), or network.create = true (this module builds it)."
     }
 
     precondition {
-      condition     = try(var.target.platform_name, null) != null || length(var.target.subnet_ids) >= 1
+      condition     = try(var.target.vpc_id, null) == null || length(var.target.subnet_ids) >= 1
       error_message = "target.vpc_id needs target.subnet_ids (private subnets; 2+ in different AZs for Multi-AZ)."
+    }
+
+    # ---------------------------------------------------------- network / vpn / dns
+    precondition {
+      condition     = var.vpn == null || var.vpn.attach == "tgw" || local.create_vpc || local.use_platform || length(var.target.route_table_ids) > 0
+      error_message = "A VPN on an existing VPC needs target.route_table_ids (the private route tables that should reach on-prem)."
+    }
+
+    precondition {
+      condition     = var.vpn == null || var.vpn.routing == "bgp" || length(var.onprem_cidrs) > 0
+      error_message = "Static VPN routing uses onprem_cidrs as the routes; set them, or use routing = bgp."
+    }
+
+    precondition {
+      condition     = var.dns == null || (length(var.dns.forward_domains) > 0 && length(var.dns.onprem_dns_servers) > 0 && length(local.subnet_ids) >= 2)
+      error_message = "dns needs forward_domains, onprem_dns_servers, and at least two subnets in different AZs for the resolver endpoints."
+    }
+
+    precondition {
+      condition     = !local.create_vpc || var.network.nat != "none" || local.s.interface_endpoints || coalesce(var.network.interface_endpoints, false)
+      error_message = "network.nat = none leaves private subnets without a path to AWS APIs. Enable network.interface_endpoints or keep a NAT."
     }
 
     precondition {

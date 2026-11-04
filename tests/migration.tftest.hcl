@@ -129,6 +129,18 @@ mock_provider "aws" {
   mock_resource "aws_codebuild_project" {
     defaults = { arn = "arn:aws:codebuild:us-east-1:123456789012:project/mock" }
   }
+  mock_data "aws_availability_zones" {
+    defaults = { names = ["us-east-1a", "us-east-1b", "us-east-1c"] }
+  }
+  mock_data "aws_route_tables" {
+    defaults = { ids = ["rtb-0aaaaaaaaaaaaaaaa", "rtb-0bbbbbbbbbbbbbbbb"] }
+  }
+  mock_resource "aws_ec2_transit_gateway" {
+    defaults = { id = "tgw-0mock0000000000", association_default_route_table_id = "tgw-rtb-0mock000000000" }
+  }
+  mock_resource "aws_flow_log" {
+    defaults = { arn = "arn:aws:ec2:us-east-1:123456789012:vpc-flow-log/fl-0mock" }
+  }
   mock_resource "aws_datasync_task" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:task/task-0mock" }
   }
@@ -467,6 +479,101 @@ run "kubernetes_needs_target_cluster" {
   variables {
     migrate = ["kubernetes"]
     target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "full_landing_zone_from_scratch" {
+  command = apply
+
+  variables {
+    profile     = "production"
+    alert_email = "migration@example.com"
+    migrate     = ["databases", "files", "servers"]
+    network     = { create = true, cidr = "10.50.0.0/16", az_count = 3, nat = "per_az" }
+    vpn         = { customer_gateway_ip = "198.51.100.10" }
+    dns         = { forward_domains = ["corp.local", "ad.corp.local"], onprem_dns_servers = ["10.20.0.2", "10.20.0.3"] }
+
+    databases       = { erp = { source = { engine = "sqlserver", database_name = "ERP", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-AbCdEf" }, target = { secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-tgt-AbCdEf" } } }
+    datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
+    file_shares     = { data = { source = { type = "nfs", agent = "dc1", host = "nas01.corp.local", path = "/data" }, destination = { type = "s3" } } }
+    servers         = { inventory = { web01 = { os = "windows" } } }
+  }
+
+  assert {
+    condition     = length(aws_vpc.this) == 1 && length(aws_subnet.private) == 3 && length(aws_subnet.public) == 3 && length(aws_nat_gateway.this) == 3
+    error_message = "3-AZ VPC with a NAT per AZ"
+  }
+  assert {
+    condition     = length(aws_vpc_endpoint.interface) == 12 && length(aws_vpc_endpoint.gateway) == 2 && length(aws_flow_log.this) == 1
+    error_message = "production adds private endpoints; gateway endpoints and flow logs always"
+  }
+  assert {
+    condition     = length(aws_vpn_gateway.this) == 1 && length(aws_vpn_gateway_route_propagation.private) == 3 && length(aws_vpn_connection_route.onprem) == 2
+    error_message = "VPN on a VGW, propagated to every private route table, static routes per on-prem CIDR"
+  }
+  assert {
+    condition     = contains(aws_vpn_connection.onprem[0].tunnel1_ike_versions, "ikev2") && !contains(aws_vpn_connection.onprem[0].tunnel1_phase1_encryption_algorithms, "AES128") && length(aws_cloudwatch_metric_alarm.vpn_down) == 1
+    error_message = "strong ciphers only, tunnel-down alarm"
+  }
+  assert {
+    condition     = length(aws_route53_resolver_rule.forward) == 2 && length(aws_route53_resolver_endpoint.inbound) == 1 && length(aws_route53_resolver_rule_association.forward) == 2
+    error_message = "hybrid DNS forwards both domains and offers an inbound endpoint"
+  }
+  assert {
+    condition     = length(aws_dms_replication_subnet_group.main[0].subnet_ids) == 3 && output.summary.network.created == true
+    error_message = "DMS runs in the module-built private subnets"
+  }
+}
+
+run "vpn_on_new_transit_gateway_with_bgp" {
+  command = apply
+
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"], route_table_ids = ["rtb-0aaaaaaaaaaaaaaaa", "rtb-0bbbbbbbbbbbbbbbb"] }
+    vpn     = { customer_gateway_ip = "203.0.113.7", attach = "tgw", routing = "bgp", bgp_asn = 65010 }
+    servers = { inventory = { app01 = { os = "rhel" } } }
+  }
+
+  assert {
+    condition     = length(aws_ec2_transit_gateway.this) == 1 && length(aws_ec2_transit_gateway_vpc_attachment.this) == 1 && length(aws_vpn_gateway.this) == 0
+    error_message = "TGW created and attached; no VGW"
+  }
+  assert {
+    condition     = length(aws_route.to_onprem_via_tgw) == 4 && length(aws_ec2_transit_gateway_route.onprem) == 0 && aws_vpn_connection.onprem[0].static_routes_only == false
+    error_message = "VPC routes to on-prem via TGW; BGP means no static TGW routes"
+  }
+}
+
+run "landing_network_must_be_one_choice" {
+  command = plan
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    network = { create = true }
+    servers = { inventory = { web01 = { os = "rhel" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "vpn_on_existing_vpc_needs_route_tables" {
+  command = plan
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    vpn     = { customer_gateway_ip = "198.51.100.10" }
+    servers = { inventory = { web01 = { os = "rhel" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "no_nat_needs_endpoints" {
+  command = plan
+  variables {
+    migrate = ["servers"]
+    network = { create = true, nat = "none" }
+    servers = { inventory = { web01 = { os = "rhel" } } }
   }
   expect_failures = [terraform_data.guardrails]
 }

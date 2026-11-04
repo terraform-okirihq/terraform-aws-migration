@@ -50,15 +50,77 @@ variable "migrate" {
 
 variable "target" {
   description = <<-EOT
-    Where migrated workloads land. Either:
+    Where migrated workloads land. One of:
       { platform_name = "acme-prod" }                         -> discover the VPC/subnets created by OkiriGabriel/platform/aws
-      { vpc_id = "vpc-...", subnet_ids = ["subnet-...", ...] } -> any existing VPC (private subnets, 2+ AZs for Multi-AZ)
+      { vpc_id = "vpc-...", subnet_ids = ["subnet-...", ...] } -> any existing VPC (private subnets, 2+ AZs for Multi-AZ);
+                                                                  add route_table_ids so the VPN can route to on-prem
+      {} with network.create = true                           -> this module builds the VPC
   EOT
   type = object({
-    platform_name = optional(string)
-    vpc_id        = optional(string)
-    subnet_ids    = optional(list(string), [])
+    platform_name   = optional(string)
+    vpc_id          = optional(string)
+    subnet_ids      = optional(list(string), [])
+    route_table_ids = optional(list(string), [])
   })
+  default = {}
+}
+
+variable "network" {
+  description = <<-EOT
+    Build the landing network here (for teams with no AWS network yet). create = true gives a VPC with public and
+    private subnets across az_count AZs, NAT, S3/DynamoDB gateway endpoints, flow logs and a locked default
+    security group. interface_endpoints adds private endpoints for DMS, MGN, Secrets Manager, KMS, logs, STS,
+    SSM, EC2 and ECR (default: on in production).
+  EOT
+  type = object({
+    create              = optional(bool, false)
+    cidr                = optional(string, "10.100.0.0/16")
+    az_count            = optional(number, 2)
+    nat                 = optional(string, "single") # none | single | per_az
+    interface_endpoints = optional(bool)
+  })
+  default = {}
+
+  validation {
+    condition     = contains(["none", "single", "per_az"], var.network.nat) && var.network.az_count >= 2 && var.network.az_count <= 4 && can(cidrhost(var.network.cidr, 0))
+    error_message = "network.nat must be none, single or per_az; az_count 2-4; cidr a valid CIDR."
+  }
+}
+
+variable "vpn" {
+  description = <<-EOT
+    Site-to-Site IPsec VPN from the target VPC to your data centre (IKEv2, AES-256, SHA-2, DH 14+, tunnel logs).
+      routing: static (routes to onprem_cidrs) | bgp
+      attach:  vgw (Virtual Private Gateway on the VPC) | tgw (Transit Gateway: transit_gateway_id, or one is created)
+  EOT
+  type = object({
+    customer_gateway_ip = string
+    bgp_asn             = optional(number, 65000)
+    routing             = optional(string, "static")
+    attach              = optional(string, "vgw")
+    transit_gateway_id  = optional(string)
+    amazon_side_asn     = optional(number, 64512)
+  })
+  default = null
+
+  validation {
+    condition     = var.vpn == null || (contains(["static", "bgp"], var.vpn.routing) && contains(["vgw", "tgw"], var.vpn.attach) && can(cidrhost("${var.vpn.customer_gateway_ip}/32", 0)))
+    error_message = "vpn.routing must be static or bgp, vpn.attach vgw or tgw, and customer_gateway_ip your router's public IPv4 address."
+  }
+}
+
+variable "dns" {
+  description = <<-EOT
+    Hybrid DNS with Route 53 Resolver: AWS resolves your on-prem domains (forward_domains -> onprem_dns_servers),
+    so DMS / DataSync / MGN can use names like nas01.corp.local; with inbound = true your DNS servers can forward
+    AWS names to the inbound endpoint IPs in summary.network.dns.
+  EOT
+  type = object({
+    forward_domains    = list(string)
+    onprem_dns_servers = list(string)
+    inbound            = optional(bool, true)
+  })
+  default = null
 }
 
 variable "onprem_cidrs" {

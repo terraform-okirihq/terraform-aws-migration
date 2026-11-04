@@ -11,7 +11,7 @@ provider "aws" {
 }
 
 module "migration" {
-  source = "../../" # in your repo: source = "terraform-aws-okirihq/migration/aws", version = "~> 0.2"
+  source = "../../" # in your repo: source = "terraform-okirihq/migration/aws", version = "~> 0.2"
 
   name         = "contoso"
   profile      = "pilot"

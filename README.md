@@ -1,7 +1,7 @@
 # AWS Migration Module
 
-[![Terraform CI](https://github.com/terraform-aws-okirihq/terraform-aws-migration/actions/workflows/terraform-ci.yml/badge.svg)](https://github.com/terraform-aws-okirihq/terraform-aws-migration/actions/workflows/terraform-ci.yml)
-[![Terraform Registry](https://img.shields.io/badge/Terraform%20Registry-terraform--aws--okirihq%2Fmigration%2Faws-623CE4?logo=terraform)](https://registry.terraform.io/modules/terraform-aws-okirihq/migration/aws)
+[![Terraform CI](https://github.com/terraform-okirihq/terraform-aws-migration/actions/workflows/terraform-ci.yml/badge.svg)](https://github.com/terraform-okirihq/terraform-aws-migration/actions/workflows/terraform-ci.yml)
+[![Terraform Registry](https://img.shields.io/badge/Terraform%20Registry-terraform--okirihq%2Fmigration%2Faws-623CE4?logo=terraform)](https://registry.terraform.io/modules/terraform-okirihq/migration/aws)
 [![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.5-623CE4?logo=terraform)](https://www.terraform.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -10,12 +10,16 @@ with one module, and set up the CI/CD that keeps shipping them. Tell it **what**
 lands; it builds the AWS side of DMS, DataSync, Application Migration Service, ECR and Velero with secure
 defaults, creates keyless deploy roles for any CI system, and prints a step-by-step cutover runbook.
 
+**Starting from nothing?** It also builds the landing network: VPC, Site-to-Site VPN to your data centre and
+hybrid DNS. Already have a VPC or the [platform module](https://registry.terraform.io/modules/OkiriGabriel/platform/aws)?
+Point it there instead. You spin up only the parts you need.
+
 Built to be temporary: when the cutover is done, `terraform destroy` removes all migration tooling and leaves
 your target environment untouched.
 
 ```hcl
 module "migration" {
-  source  = "terraform-aws-okirihq/migration/aws"
+  source  = "terraform-okirihq/migration/aws"
   version = "~> 0.2"
 
   name         = "acme"
@@ -46,6 +50,7 @@ module "migration" {
 - [What it supports](#what-it-supports)
 - [Quick start](#quick-start)
 - [How a migration runs](#how-a-migration-runs)
+- [Landing network: VPC, VPN, DNS](#landing-network-vpc-vpn-dns)
 - [Databases](#databases)
 - [Files](#files)
 - [Servers](#servers)
@@ -67,6 +72,7 @@ module "migration" {
 
 | Workload | Sources | Lands on | AWS service |
 |:---------|:--------|:---------|:------------|
+| Network | Your data centre (any IPsec router / firewall), your DNS servers | A VPC built here, an existing VPC, or the platform module | VPC, Site-to-Site VPN (VGW or Transit Gateway), Route 53 Resolver |
 | Databases | MySQL, MariaDB, PostgreSQL, Oracle, SQL Server, Db2, SAP ASE (Sybase), MongoDB | RDS / Aurora (MySQL, PostgreSQL), RDS for Oracle / SQL Server, DocumentDB, Redshift, S3 data lake | DMS (Serverless, or instance-based where Serverless doesn't apply) |
 | Schemas and code | Oracle, SQL Server, Db2, Sybase, MySQL, PostgreSQL, ... | PostgreSQL / Aurora, MySQL, ... | DMS Schema Conversion ([submodule](modules/schema-conversion)) |
 | Files | NFS (Linux/Unix), SMB (Windows), HDFS (Hadoop, simple or Kerberos), S3-compatible storage (MinIO, StorageGRID, GCS interop), S3 in another account or region, Azure Blob | S3 (any storage class), EFS, FSx for Windows File Server | DataSync |
@@ -79,6 +85,7 @@ Mix any of them: a Windows estate, a Linux estate, or both at once. See [example
 
 | Example | Shows |
 |:--------|:------|
+| [from-scratch](examples/from-scratch/main.tf) | Empty account: VPC + VPN + hybrid DNS, then SQL Server, SMB shares, Windows / RHEL / Ubuntu servers (automated MGN) |
 | [windows-estate](examples/windows-estate/main.tf) | SQL Server, SMB shares into FSx for Windows, Windows Server with license-included and BYOL |
 | [linux-estate](examples/linux-estate/main.tf) | MySQL to Aurora, PostgreSQL with table filters, NFS into S3 and EFS, RHEL / Ubuntu / SUSE / Oracle Linux |
 | [mixed-estate](examples/mixed-estate/main.tf) | Production profile: Oracle to Aurora PostgreSQL, Sybase, MongoDB to DocumentDB, Db2 to S3, HDFS, MinIO |
@@ -92,9 +99,10 @@ Mix any of them: a Windows estate, a Linux estate, or both at once. See [example
 
 **You need:**
 
-1. **Network connectivity** from AWS to your data centre: Site-to-Site VPN, Direct Connect or Transit Gateway.
-   Put those on-prem ranges in `onprem_cidrs`.
-2. **A target VPC** with private subnets in at least two AZs, or a stack built with the platform module.
+1. **Your on-prem ranges** in `onprem_cidrs`. No VPN yet? Set `vpn` and the module builds it (or bring your own
+   VPN, Direct Connect or Transit Gateway).
+2. **A landing network:** `network = { create = true }` builds one; or use an existing VPC (private subnets in two
+   AZs) or a stack from the platform module.
 3. **Secrets in Secrets Manager**, one per database endpoint, as JSON in the format DMS reads natively:
    ```json
    { "username": "dms_user", "password": "...", "host": "10.20.0.15", "port": 5432 }
@@ -129,6 +137,49 @@ first. The `summary` output gives the exact `start`, `status` and `stop` command
 `run` / `status` commands for every share, and the full MGN sequence for servers.
 
 Every DMS and DataSync state change in this stack is sent to an SNS topic. Set `alert_email` to receive them.
+
+---
+
+## Landing network: VPC, VPN, DNS
+
+Choose exactly one landing network:
+
+| Option | Input | Use when |
+|:-------|:------|:---------|
+| Build it here | `network = { create = true, cidr = "10.100.0.0/16", az_count = 3, nat = "per_az" }` | No AWS network yet |
+| Existing VPC | `target = { vpc_id = "...", subnet_ids = [...], route_table_ids = [...] }` | You already have one |
+| Platform module | `target = { platform_name = "acme-prod" }` | You built it with `OkiriGabriel/platform/aws` |
+
+`network.create` builds public and private subnets in each AZ, NAT (`none`, `single` or `per_az`), free S3 and
+DynamoDB gateway endpoints, VPC flow logs and a locked default security group. With `interface_endpoints`
+(default in production) it adds private endpoints for DMS, MGN, Secrets Manager, KMS, CloudWatch Logs, STS, SSM,
+EC2 and ECR, reachable from on-prem too, so migration traffic to AWS APIs never needs the internet.
+
+```hcl
+vpn = {
+  customer_gateway_ip = "198.51.100.10"  # your firewall's public IP
+  bgp_asn             = 65000
+  routing             = "static"         # static (routes = onprem_cidrs) | bgp
+  attach              = "vgw"            # vgw | tgw (transit_gateway_id, or one is created)
+}
+
+dns = {
+  forward_domains    = ["corp.local"]              # AWS resolves these via your DNS servers
+  onprem_dns_servers = ["10.20.0.2", "10.20.0.3"]
+  inbound            = true                        # your DNS can resolve AWS names via the inbound IPs
+}
+```
+
+| Behaviour | Detail |
+|:----------|:-------|
+| VPN security | IKEv2 only, AES-256 / AES-256-GCM, SHA-2, DH groups 14+, both tunnels logged to CloudWatch |
+| Routing | Static routes for every `onprem_cidrs` entry (on the VGW or the TGW route table), or BGP; private route tables reach on-prem through the VGW (propagation) or TGW |
+| Router setup | `summary.network.vpn.router_config` gives the commands that download a ready-made config for your firewall model (Cisco, Fortinet, Palo Alto, pfSense, Juniper, ...) |
+| Monitoring | Alarm `<name>-<env>-mig-vpn-down` when both tunnels are down, to the alerts topic |
+| Hybrid DNS | Outbound resolver endpoint + forwarding rules per domain; inbound endpoint IPs in `summary.network.dns.inbound_ips` for your conditional forwarders |
+
+The VPC, subnets and gateways carry `Lifecycle = keep`: they are the foundation your migrated workloads run on,
+so move them to a long-lived stack (`terraform state mv` / `state rm`) before destroying the migration tooling.
 
 ---
 
@@ -331,7 +382,7 @@ converted before data is copied. The [schema-conversion submodule](modules/schem
 
 ```hcl
 module "schema_conversion" {
-  source  = "terraform-aws-okirihq/migration/aws//modules/schema-conversion"
+  source  = "terraform-okirihq/migration/aws//modules/schema-conversion"
   version = "~> 0.2"
 
   name    = "acme"
@@ -385,7 +436,10 @@ The plan stops with a clear message instead of failing halfway through an apply:
 | Databases with fewer than two subnets | DMS needs subnets in two AZs |
 | A share pointing at an unknown agent, or an agent with zero / several activation methods | Fix `datasync_agents` |
 | SMB / object storage / FSx without a credentials secret | Set `secret_arn` / `fsx_secret_arn` |
-| Both, or neither, of `target.platform_name` and `target.vpc_id` | Choose one |
+| More or fewer than one landing network (`network.create`, `target.vpc_id`, `target.platform_name`) | Choose one |
+| VPN on an existing VPC without `route_table_ids`; static routing without `onprem_cidrs` | Set them |
+| `dns` without domains / servers, or with fewer than two subnets | Fix `dns` |
+| `network.nat = "none"` without interface endpoints | Enable endpoints or keep a NAT |
 | `production` without `alert_email` | Set it |
 | Kerberos HDFS without a principal or secret | Set `kerberos_principal` and `secret_arn` |
 | `images` with nothing to create; Azure cache without `registry_url`; Docker Hub / GHCR / GitLab / Azure cache without an `ecr-pullthroughcache/` secret | Fix `images` |
@@ -412,6 +466,8 @@ The plan stops with a clear message instead of failing halfway through an apply:
 | `pipeline_role_arns` | Deploy role per pipeline |
 | `mgn_setup_script` | The idempotent MGN setup script (`servers.automate`) |
 | `schema_conversion_network` | Input for the schema-conversion submodule |
+| `vpc` | VPC, private subnets and route tables (built here or discovered) |
+| `vpn` | VPN connection, tunnel IPs, router-config commands |
 
 ---
 
@@ -419,7 +475,7 @@ The plan stops with a clear message instead of failing halfway through an apply:
 
 ```hcl
 module "migration" {
-  source  = "terraform-aws-okirihq/migration/aws"
+  source  = "terraform-okirihq/migration/aws"
   version = "~> 0.2"
 
   name         = "acme"
@@ -468,7 +524,7 @@ terraform init -backend=false
 terraform test
 ```
 
-The suite runs a mixed estate (seven database engines, four share types, five operating systems), Kerberos /
+The suite runs a from-scratch landing zone (VPC + VPN + DNS), a VPN on a Transit Gateway with BGP, a mixed estate (seven database engines, four share types, five operating systems), Kerberos /
 S3 / Azure sources, MGN automation, images + Kubernetes + all seven CI systems, a production deployment on the
 platform module, and every guardrail, against mocked providers: no credentials, nothing created. The
 schema-conversion submodule has its own suite (`cd modules/schema-conversion && terraform test`). CI runs on every push and pull request: format, TFLint, validate (module and all examples), tests,
@@ -481,6 +537,7 @@ Gitleaks and Checkov.
 ```
 .
 ├── main.tf            # KMS, alerts topic, platform security-group rules
+├── network.tf         # VPC, NAT, endpoints, flow logs, Site-to-Site VPN, Transit Gateway, Route 53 Resolver
 ├── variables.tf       # Inputs
 ├── locals.tf          # Profiles, target network discovery, engine rules
 ├── guardrails.tf      # Plan-time refusals
@@ -494,7 +551,7 @@ Gitleaks and Checkov.
 ├── versions.tf
 ├── modules/
 │   └── schema-conversion/   # DMS Schema Conversion (AWSCC provider)
-├── examples/          # windows-estate, linux-estate, mixed-estate, kubernetes-and-cicd, schema-conversion, with-platform
+├── examples/          # from-scratch, windows-estate, linux-estate, mixed-estate, kubernetes-and-cicd, schema-conversion, with-platform
 └── tests/             # terraform test suite (mocked provider)
 ```
 

@@ -15,6 +15,7 @@ locals {
       create_kms_key         = false
       datasync_private_link  = false
       require_alert_email    = false
+      interface_endpoints    = false
     }
     production = {
       dms_min_capacity_units = 2
@@ -27,6 +28,7 @@ locals {
       create_kms_key         = true
       datasync_private_link  = true
       require_alert_email    = true
+      interface_endpoints    = true
     }
   }
 
@@ -63,12 +65,36 @@ locals {
 # ============================================
 
 locals {
+  create_vpc   = var.network.create
   use_platform = try(var.target.platform_name, null) != null
   platform     = local.use_platform ? var.target.platform_name : ""
 
-  vpc_id     = local.use_platform ? data.aws_vpc.platform[0].id : var.target.vpc_id
-  vpc_cidr   = try(data.aws_vpc.target[0].cidr_block, "")
-  subnet_ids = local.use_platform ? sort(data.aws_subnets.platform_private[0].ids) : var.target.subnet_ids
+  vpc_id = local.create_vpc ? aws_vpc.this[0].id : (local.use_platform ? data.aws_vpc.platform[0].id : var.target.vpc_id)
+
+  # Known at plan time for a created VPC (from the input), looked up otherwise.
+  vpc_cidr = local.create_vpc ? var.network.cidr : try(data.aws_vpc.target[0].cidr_block, "")
+
+  subnet_ids = (
+    local.create_vpc ? aws_subnet.private[*].id :
+    local.use_platform ? sort(data.aws_subnets.platform_private[0].ids) :
+    var.target.subnet_ids
+  )
+
+  route_table_ids = (
+    local.create_vpc ? aws_route_table.private[*].id :
+    local.use_platform ? sort(data.aws_route_tables.platform_private[0].ids) :
+    var.target.route_table_ids
+  )
+}
+
+data "aws_route_tables" "platform_private" {
+  count  = local.use_platform ? 1 : 0
+  vpc_id = data.aws_vpc.platform[0].id
+
+  filter {
+    name   = "tag:Name"
+    values = ["${local.platform}-private-rt-*"]
+  }
 }
 
 data "aws_vpc" "platform" {
@@ -89,7 +115,7 @@ data "aws_subnets" "platform_private" {
 
 # Only looked up once a VPC is known; with no target the guardrails explain what is missing instead.
 data "aws_vpc" "target" {
-  count = local.vpc_id != null ? 1 : 0
+  count = !local.create_vpc && (local.use_platform || try(var.target.vpc_id, null) != null) ? 1 : 0
   id    = local.vpc_id
 }
 

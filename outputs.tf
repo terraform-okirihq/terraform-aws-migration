@@ -39,6 +39,8 @@ locals {
   } }
 
   setup_steps = compact([
+    local.vpn_on ? "Network: configure your router with summary.network.vpn.router_config (both tunnels), then check the ${local.prefix}-vpn-down alarm turns OK." : "",
+    local.dns_on && try(var.dns.inbound, true) ? "Network: point on-prem conditional forwarders for AWS names at summary.network.dns.inbound_ips." : "",
     var.alert_email != "" ? "Confirm the SNS subscription email sent to ${var.alert_email}." : "Set alert_email to be told when a replication or transfer fails.",
     local.has.databases ? "Databases: run the 'start' command per database (or set start = true), watch 'status', and stop replication at cutover." : "",
     local.has.databases && length(local.platform_db_targets) == 0 ? "Databases: allow security group ${try(aws_security_group.dms[0].id, "")} on each target database's security group (port of that engine)." : "",
@@ -57,7 +59,7 @@ output "summary" {
     name    = local.prefix
     profile = var.profile
     region  = local.region
-    network = "VPC ${local.vpc_id} (${local.vpc_cidr}), ${length(local.subnet_ids)} private subnets, on-prem ${join(", ", var.onprem_cidrs)}"
+    network = merge(local.network_summary, { private_subnets = length(local.subnet_ids), onprem = var.onprem_cidrs })
 
     databases = local.db_runbook
     files     = local.share_runbook
@@ -158,4 +160,19 @@ output "schema_conversion_network" {
     security_group_id = aws_security_group.dms[0].id
     kms_key_arn       = local.kms_key_arn
   } : null
+}
+
+output "vpc" {
+  description = "Landing network: VPC, private subnets and route tables (created here or discovered)."
+  value = {
+    id                      = local.vpc_id
+    cidr                    = local.vpc_cidr
+    private_subnet_ids      = local.subnet_ids
+    private_route_table_ids = local.route_table_ids
+  }
+}
+
+output "vpn" {
+  description = "Site-to-Site VPN details (null without vpn)."
+  value       = local.network_summary.vpn
 }

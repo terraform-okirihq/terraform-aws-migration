@@ -8,9 +8,12 @@ locals {
   # Only shares that pass the guardrails become resources, so mistakes surface as guardrail messages.
   shares = local.has.files ? {
     for k, f in var.file_shares : k => f
-    if contains(keys(local.agents_valid), f.source.agent)
-    && (!contains(["smb", "object-storage"], f.source.type) || f.source.secret_arn != null)
-    && (f.source.type == "hdfs" ? length(f.source.hdfs_name_nodes) > 0 : f.source.host != null)
+    if(f.source.type == "s3" || contains(keys(local.agents_valid), coalesce(f.source.agent, "-")))
+    && (!(contains(["smb", "object-storage", "azure-blob"], f.source.type) || (f.source.type == "hdfs" && f.source.hdfs_auth == "kerberos")) || f.source.secret_arn != null)
+    && (f.source.type == "hdfs" ? length(f.source.hdfs_name_nodes) > 0 && (f.source.hdfs_auth == "simple" || f.source.kerberos_principal != null) :
+      f.source.type == "s3" ? f.source.s3_bucket != null :
+      f.source.type == "azure-blob" ? f.source.azure_container_url != null :
+    f.source.host != null)
     && (f.destination.type != "efs" || f.destination.efs_file_system_arn != null || local.use_platform)
     && (f.destination.type != "fsx-windows" || (f.destination.fsx_windows_arn != null && f.destination.fsx_secret_arn != null))
   } : {}
@@ -22,6 +25,8 @@ locals {
     smb    = { for k, f in local.shares : k => f if f.source.type == "smb" }
     hdfs   = { for k, f in local.shares : k => f if f.source.type == "hdfs" }
     object = { for k, f in local.shares : k => f if f.source.type == "object-storage" }
+    s3     = { for k, f in local.shares : k => f if f.source.type == "s3" }
+    azure  = { for k, f in local.shares : k => f if f.source.type == "azure-blob" }
   }
 
   dest_s3         = { for k, f in local.shares : k => f if f.destination.type == "s3" }
@@ -167,8 +172,21 @@ resource "aws_datasync_location_hdfs" "source" {
   for_each            = local.shares_by_type.hdfs
   agent_arns          = [local.agent_arn[each.value.source.agent]]
   subdirectory        = each.value.source.path
-  authentication_type = "SIMPLE"
-  simple_user         = each.value.source.hdfs_simple_user
+  authentication_type = upper(each.value.source.hdfs_auth)
+  simple_user         = each.value.source.hdfs_auth == "simple" ? each.value.source.hdfs_simple_user : null
+
+  # Kerberos: keytab (base64) and krb5.conf come from Secrets Manager.
+  kerberos_principal        = each.value.source.hdfs_auth == "kerberos" ? each.value.source.kerberos_principal : null
+  kerberos_keytab_base64    = each.value.source.hdfs_auth == "kerberos" ? local.share_cred[each.key].keytab_base64 : null
+  kerberos_krb5_conf_base64 = each.value.source.hdfs_auth == "kerberos" ? base64encode(local.share_cred[each.key].krb5_conf) : null
+
+  dynamic "qop_configuration" {
+    for_each = each.value.source.hdfs_auth == "kerberos" ? [1] : []
+    content {
+      rpc_protection           = each.value.source.hdfs_protection
+      data_transfer_protection = each.value.source.hdfs_protection
+    }
+  }
 
   dynamic "name_node" {
     for_each = each.value.source.hdfs_name_nodes
@@ -194,12 +212,44 @@ resource "aws_datasync_location_object_storage" "source" {
   tags = merge(local.tags, { Share = each.key })
 }
 
+# S3 bucket in another account or region (agentless). The source bucket's owner must allow the
+# DataSync role; the exact bucket policy is in summary.files.<share>.source_bucket_policy.
+resource "aws_datasync_location_s3" "source" {
+  for_each      = local.shares_by_type.s3
+  s3_bucket_arn = "arn:${local.partition}:s3:::${each.value.source.s3_bucket}"
+  subdirectory  = each.value.source.path
+
+  s3_config {
+    bucket_access_role_arn = aws_iam_role.datasync_s3[0].arn
+  }
+
+  tags = merge(local.tags, { Share = each.key })
+
+  depends_on = [aws_iam_role_policy.datasync_s3]
+}
+
+resource "aws_datasync_location_azure_blob" "source" {
+  for_each            = local.shares_by_type.azure
+  agent_arns          = [local.agent_arn[each.value.source.agent]]
+  container_url       = each.value.source.azure_container_url
+  subdirectory        = each.value.source.path
+  authentication_type = "SAS"
+
+  sas_configuration {
+    token = local.share_cred[each.key].sas_token
+  }
+
+  tags = merge(local.tags, { Share = each.key })
+}
+
 locals {
   source_location_arn = merge(
     { for k, l in aws_datasync_location_nfs.source : k => l.arn },
     { for k, l in aws_datasync_location_smb.source : k => l.arn },
     { for k, l in aws_datasync_location_hdfs.source : k => l.arn },
     { for k, l in aws_datasync_location_object_storage.source : k => l.arn },
+    { for k, l in aws_datasync_location_s3.source : k => l.arn },
+    { for k, l in aws_datasync_location_azure_blob.source : k => l.arn },
   )
 }
 
@@ -276,7 +326,7 @@ locals {
 }
 
 resource "aws_iam_role" "datasync_s3" {
-  count = length(local.dest_s3) > 0 ? 1 : 0
+  count = length(local.dest_s3) + length(local.shares_by_type.s3) > 0 ? 1 : 0
   name  = "${local.prefix}-datasync-s3"
 
   assume_role_policy = jsonencode({
@@ -300,6 +350,14 @@ resource "aws_iam_role_policy" "datasync_s3" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = concat(
+      length(local.shares_by_type.s3) > 0 ? [
+        {
+          Sid      = "ReadSourceBuckets"
+          Effect   = "Allow"
+          Action   = ["s3:GetBucketLocation", "s3:ListBucket", "s3:GetObject", "s3:GetObjectTagging", "s3:GetObjectVersion", "s3:GetObjectVersionTagging"]
+          Resource = flatten([for f in values(local.shares_by_type.s3) : ["arn:${local.partition}:s3:::${f.source.s3_bucket}", "arn:${local.partition}:s3:::${f.source.s3_bucket}/*"]])
+        }
+      ] : [],
       [
         {
           Effect   = "Allow"
@@ -445,9 +503,9 @@ resource "aws_datasync_task" "main" {
     transfer_mode          = "CHANGED"
     log_level              = var.profile == "production" ? "TRANSFER" : "BASIC"
     # SMB and object storage carry no POSIX metadata.
-    posix_permissions = contains(["smb", "object-storage"], each.value.source.type) ? "NONE" : null
-    uid               = contains(["smb", "object-storage"], each.value.source.type) ? "NONE" : null
-    gid               = contains(["smb", "object-storage"], each.value.source.type) ? "NONE" : null
+    posix_permissions = contains(["smb", "object-storage", "s3", "azure-blob"], each.value.source.type) ? "NONE" : null
+    uid               = contains(["smb", "object-storage", "s3", "azure-blob"], each.value.source.type) ? "NONE" : null
+    gid               = contains(["smb", "object-storage", "s3", "azure-blob"], each.value.source.type) ? "NONE" : null
   }
 
   dynamic "excludes" {

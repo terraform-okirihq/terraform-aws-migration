@@ -4,7 +4,8 @@
 # Refuse unsafe or incomplete configurations before anything is created; each message says what to change.
 
 locals {
-  share_needs_secret = { for k, f in var.file_shares : k => contains(["smb", "object-storage"], f.source.type) }
+  share_needs_secret = { for k, f in var.file_shares : k => contains(["smb", "object-storage", "azure-blob"], f.source.type) || (f.source.type == "hdfs" && f.source.hdfs_auth == "kerberos") }
+  share_needs_agent  = { for k, f in var.file_shares : k => f.source.type != "s3" }
 }
 
 resource "terraform_data" "guardrails" {
@@ -13,13 +14,34 @@ resource "terraform_data" "guardrails" {
   lifecycle {
     # ---------------------------------------------------------- target
     precondition {
-      condition     = (try(var.target.platform_name, null) != null) != (try(var.target.vpc_id, null) != null)
-      error_message = "Set exactly one of target.platform_name (to reuse the platform module's VPC) or target.vpc_id + target.subnet_ids."
+      condition     = length([for x in [try(var.target.platform_name, null) != null, try(var.target.vpc_id, null) != null, var.network.create] : x if x]) == 1
+      error_message = "Choose exactly one landing network: target.platform_name (platform module), target.vpc_id + subnet_ids (existing VPC), or network.create = true (this module builds it)."
     }
 
     precondition {
-      condition     = try(var.target.platform_name, null) != null || length(var.target.subnet_ids) >= 1
+      condition     = try(var.target.vpc_id, null) == null || length(var.target.subnet_ids) >= 1
       error_message = "target.vpc_id needs target.subnet_ids (private subnets; 2+ in different AZs for Multi-AZ)."
+    }
+
+    # ---------------------------------------------------------- network / vpn / dns
+    precondition {
+      condition     = var.vpn == null || var.vpn.attach == "tgw" || local.create_vpc || local.use_platform || length(var.target.route_table_ids) > 0
+      error_message = "A VPN on an existing VPC needs target.route_table_ids (the private route tables that should reach on-prem)."
+    }
+
+    precondition {
+      condition     = var.vpn == null || var.vpn.routing == "bgp" || length(var.onprem_cidrs) > 0
+      error_message = "Static VPN routing uses onprem_cidrs as the routes; set them, or use routing = bgp."
+    }
+
+    precondition {
+      condition     = var.dns == null || (length(var.dns.forward_domains) > 0 && length(var.dns.onprem_dns_servers) > 0 && length(local.subnet_ids) >= 2)
+      error_message = "dns needs forward_domains, onprem_dns_servers, and at least two subnets in different AZs for the resolver endpoints."
+    }
+
+    precondition {
+      condition     = !local.create_vpc || var.network.nat != "none" || local.s.interface_endpoints || coalesce(var.network.interface_endpoints, false)
+      error_message = "network.nat = none leaves private subnets without a path to AWS APIs. Enable network.interface_endpoints or keep a NAT."
     }
 
     precondition {
@@ -84,8 +106,8 @@ resource "terraform_data" "guardrails" {
 
     # ---------------------------------------------------------- files
     precondition {
-      condition     = alltrue([for f in values(var.file_shares) : contains(keys(var.datasync_agents), f.source.agent)])
-      error_message = "Every file_shares.*.source.agent must name an entry in datasync_agents."
+      condition     = alltrue([for k, f in var.file_shares : !local.share_needs_agent[k] || contains(keys(var.datasync_agents), coalesce(f.source.agent, "-"))])
+      error_message = "Every file_shares.*.source.agent must name an entry in datasync_agents (all source types except s3 need an agent)."
     }
 
     precondition {
@@ -97,12 +119,17 @@ resource "terraform_data" "guardrails" {
 
     precondition {
       condition     = alltrue([for k, f in var.file_shares : !local.share_needs_secret[k] || f.source.secret_arn != null])
-      error_message = "SMB and object-storage sources need source.secret_arn (Secrets Manager JSON with the credentials)."
+      error_message = "SMB, object-storage, azure-blob and Kerberos HDFS sources need source.secret_arn (Secrets Manager JSON with the credentials)."
     }
 
     precondition {
-      condition     = alltrue([for f in values(var.file_shares) : f.source.type == "hdfs" ? length(f.source.hdfs_name_nodes) > 0 : f.source.host != null])
-      error_message = "nfs / smb / object-storage sources need source.host; hdfs sources need source.hdfs_name_nodes."
+      condition = alltrue([for f in values(var.file_shares) :
+        f.source.type == "hdfs" ? length(f.source.hdfs_name_nodes) > 0 && (f.source.hdfs_auth == "simple" || f.source.kerberos_principal != null) :
+        f.source.type == "s3" ? f.source.s3_bucket != null :
+        f.source.type == "azure-blob" ? f.source.azure_container_url != null :
+        f.source.host != null
+      ])
+      error_message = "nfs / smb / object-storage need source.host; hdfs needs hdfs_name_nodes (and kerberos_principal for Kerberos); s3 needs source.s3_bucket; azure-blob needs source.azure_container_url."
     }
 
     precondition {
@@ -113,6 +140,65 @@ resource "terraform_data" "guardrails" {
     precondition {
       condition     = alltrue([for f in values(var.file_shares) : f.destination.type != "fsx-windows" || (f.destination.fsx_windows_arn != null && f.destination.fsx_secret_arn != null)])
       error_message = "fsx-windows destinations need destination.fsx_windows_arn and destination.fsx_secret_arn."
+    }
+
+    # ---------------------------------------------------------- images
+    precondition {
+      condition     = !local.has.images || length(var.images.repositories) + length(var.images.copy) + length(var.images.pull_through) > 0
+      error_message = "migrate includes \"images\" but images has no repositories, copy or pull_through entries."
+    }
+
+    precondition {
+      condition     = alltrue([for p in values(var.images.pull_through) : p.upstream != "azure" || p.registry_url != null])
+      error_message = "images.pull_through with upstream = azure needs registry_url (e.g. myregistry.azurecr.io)."
+    }
+
+    precondition {
+      condition = alltrue([for p in values(var.images.pull_through) :
+        !contains(["docker-hub", "ghcr", "gitlab", "azure"], p.upstream) || can(regex(":secret:ecr-pullthroughcache/", coalesce(p.secret_arn, "-")))
+      ])
+      error_message = "Docker Hub, GHCR, GitLab and Azure pull-through caches need secret_arn for a Secrets Manager secret whose name starts with ecr-pullthroughcache/ (an ECR requirement)."
+    }
+
+    # ---------------------------------------------------------- kubernetes
+    precondition {
+      condition     = !local.has.kubernetes || try(var.kubernetes.target_cluster_name, null) != null || local.use_platform
+      error_message = "kubernetes needs target_cluster_name (the EKS cluster to restore into), or target.platform_name to use the platform's cluster."
+    }
+
+    precondition {
+      condition     = !local.has.kubernetes || var.kubernetes.source_auth != "roles-anywhere" || var.onprem_ca_certificate_pem != null
+      error_message = "kubernetes.source_auth = roles-anywhere needs onprem_ca_certificate_pem (the CA that issues the on-prem cluster's certificate)."
+    }
+
+    # ---------------------------------------------------------- pipelines
+    precondition {
+      condition = alltrue([for p in values(local.pipe) :
+        !contains(["github", "gitlab"], p.provider) || p.repository != null || length(p.subjects) > 0
+      ])
+      error_message = "github / gitlab pipelines need repository (\"owner/repo\" or \"group/project\") or explicit subjects."
+    }
+
+    precondition {
+      condition = alltrue([for p in values(local.pipe) :
+        !contains(["bitbucket", "circleci", "azure-devops"], p.provider) || (p.issuer_url != null && p.aud != null && length(p.subjects) > 0)
+      ])
+      error_message = "bitbucket / circleci / azure-devops pipelines need issuer_url, audience (azure-devops defaults to api://AzureADTokenExchange) and subjects."
+    }
+
+    precondition {
+      condition     = alltrue([for p in values(var.pipelines) : p.provider != "jenkins" || var.onprem_ca_certificate_pem != null])
+      error_message = "jenkins (on-prem CI) pipelines authenticate with a client certificate: set onprem_ca_certificate_pem."
+    }
+
+    precondition {
+      condition     = alltrue([for p in values(var.pipelines) : p.provider != "codebuild" || p.codebuild_repo_url != null])
+      error_message = "codebuild pipelines need codebuild_repo_url (e.g. https://github.com/owner/repo)."
+    }
+
+    precondition {
+      condition     = alltrue(flatten([for p in values(local.pipe) : [for s in p.subs : s != "*" && !startswith(s, "*")]]))
+      error_message = "A pipeline subject cannot start with *; that would let any repository assume the role."
     }
 
     # ---------------------------------------------------------- servers

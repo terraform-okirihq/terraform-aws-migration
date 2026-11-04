@@ -39,26 +39,88 @@ variable "profile" {
 }
 
 variable "migrate" {
-  description = "What to migrate: databases (DMS), files (DataSync), servers (Application Migration Service)."
+  description = "What to migrate: databases (DMS), files (DataSync), servers (MGN), images (container registries -> ECR), kubernetes (clusters -> EKS with Velero)."
   type        = set(string)
 
   validation {
-    condition     = length(var.migrate) > 0 && alltrue([for m in var.migrate : contains(["databases", "files", "servers"], m)])
-    error_message = "migrate must contain one or more of: databases, files, servers."
+    condition     = length(var.migrate) > 0 && alltrue([for m in var.migrate : contains(["databases", "files", "servers", "images", "kubernetes"], m)])
+    error_message = "migrate must contain one or more of: databases, files, servers, images, kubernetes."
   }
 }
 
 variable "target" {
   description = <<-EOT
-    Where migrated workloads land. Either:
+    Where migrated workloads land. One of:
       { platform_name = "acme-prod" }                         -> discover the VPC/subnets created by OkiriGabriel/platform/aws
-      { vpc_id = "vpc-...", subnet_ids = ["subnet-...", ...] } -> any existing VPC (private subnets, 2+ AZs for Multi-AZ)
+      { vpc_id = "vpc-...", subnet_ids = ["subnet-...", ...] } -> any existing VPC (private subnets, 2+ AZs for Multi-AZ);
+                                                                  add route_table_ids so the VPN can route to on-prem
+      {} with network.create = true                           -> this module builds the VPC
   EOT
   type = object({
-    platform_name = optional(string)
-    vpc_id        = optional(string)
-    subnet_ids    = optional(list(string), [])
+    platform_name   = optional(string)
+    vpc_id          = optional(string)
+    subnet_ids      = optional(list(string), [])
+    route_table_ids = optional(list(string), [])
   })
+  default = {}
+}
+
+variable "network" {
+  description = <<-EOT
+    Build the landing network here (for teams with no AWS network yet). create = true gives a VPC with public and
+    private subnets across az_count AZs, NAT, S3/DynamoDB gateway endpoints, flow logs and a locked default
+    security group. interface_endpoints adds private endpoints for DMS, MGN, Secrets Manager, KMS, logs, STS,
+    SSM, EC2 and ECR (default: on in production).
+  EOT
+  type = object({
+    create              = optional(bool, false)
+    cidr                = optional(string, "10.100.0.0/16")
+    az_count            = optional(number, 2)
+    nat                 = optional(string, "single") # none | single | per_az
+    interface_endpoints = optional(bool)
+  })
+  default = {}
+
+  validation {
+    condition     = contains(["none", "single", "per_az"], var.network.nat) && var.network.az_count >= 2 && var.network.az_count <= 4 && can(cidrhost(var.network.cidr, 0))
+    error_message = "network.nat must be none, single or per_az; az_count 2-4; cidr a valid CIDR."
+  }
+}
+
+variable "vpn" {
+  description = <<-EOT
+    Site-to-Site IPsec VPN from the target VPC to your data centre (IKEv2, AES-256, SHA-2, DH 14+, tunnel logs).
+      routing: static (routes to onprem_cidrs) | bgp
+      attach:  vgw (Virtual Private Gateway on the VPC) | tgw (Transit Gateway: transit_gateway_id, or one is created)
+  EOT
+  type = object({
+    customer_gateway_ip = string
+    bgp_asn             = optional(number, 65000)
+    routing             = optional(string, "static")
+    attach              = optional(string, "vgw")
+    transit_gateway_id  = optional(string)
+    amazon_side_asn     = optional(number, 64512)
+  })
+  default = null
+
+  validation {
+    condition     = var.vpn == null || (contains(["static", "bgp"], var.vpn.routing) && contains(["vgw", "tgw"], var.vpn.attach) && can(cidrhost("${var.vpn.customer_gateway_ip}/32", 0)))
+    error_message = "vpn.routing must be static or bgp, vpn.attach vgw or tgw, and customer_gateway_ip your router's public IPv4 address."
+  }
+}
+
+variable "dns" {
+  description = <<-EOT
+    Hybrid DNS with Route 53 Resolver: AWS resolves your on-prem domains (forward_domains -> onprem_dns_servers),
+    so DMS / DataSync / MGN can use names like nas01.corp.local; with inbound = true your DNS servers can forward
+    AWS names to the inbound endpoint IPs in summary.network.dns.
+  EOT
+  type = object({
+    forward_domains    = list(string)
+    onprem_dns_servers = list(string)
+    inbound            = optional(bool, true)
+  })
+  default = null
 }
 
 variable "onprem_cidrs" {
@@ -211,25 +273,32 @@ variable "datasync_agents" {
 variable "file_shares" {
   description = <<-EOT
     One entry per share to copy.
-      source.type:      nfs (Linux/Unix) | smb (Windows) | hdfs | object-storage (S3-compatible: MinIO, NetApp StorageGRID, ...)
+      source.type:      nfs (Linux/Unix) | smb (Windows) | hdfs | object-storage (S3-compatible: MinIO, NetApp StorageGRID,
+                        Google Cloud Storage interop, ...) | s3 (another account or region, no agent) | azure-blob
       destination.type: s3 | efs | fsx-windows
-    Credentials (SMB, object storage, FSx) come from Secrets Manager JSON:
-      SMB / FSx: { "username": "...", "password": "..." }   Object storage: { "access_key": "...", "secret_key": "..." }
+    Credentials come from Secrets Manager JSON:
+      SMB / FSx: { "username": "...", "password": "..." }      Object storage: { "access_key": "...", "secret_key": "..." }
+      Azure Blob: { "sas_token": "..." }                        HDFS Kerberos: { "keytab_base64": "...", "krb5_conf": "..." }
   EOT
   type = map(object({
     source = object({
-      type             = string
-      agent            = string # key in datasync_agents
-      host             = optional(string)
-      path             = optional(string, "/") # export / share path, or bucket name for object-storage
-      nfs_version      = optional(string, "AUTOMATIC")
-      smb_domain       = optional(string)
-      smb_version      = optional(string, "AUTOMATIC")
-      secret_arn       = optional(string)
-      object_port      = optional(number, 443)
-      object_protocol  = optional(string, "HTTPS")
-      hdfs_name_nodes  = optional(list(object({ host = string, port = optional(number, 8020) })), [])
-      hdfs_simple_user = optional(string)
+      type                = string
+      agent               = optional(string) # key in datasync_agents (not needed for s3)
+      host                = optional(string)
+      path                = optional(string, "/") # export / share path, or bucket name for object-storage
+      nfs_version         = optional(string, "AUTOMATIC")
+      smb_domain          = optional(string)
+      smb_version         = optional(string, "AUTOMATIC")
+      secret_arn          = optional(string)
+      object_port         = optional(number, 443)
+      object_protocol     = optional(string, "HTTPS")
+      hdfs_name_nodes     = optional(list(object({ host = string, port = optional(number, 8020) })), [])
+      hdfs_simple_user    = optional(string)
+      hdfs_auth           = optional(string, "simple")  # simple | kerberos
+      kerberos_principal  = optional(string)            # e.g. hdfs/nn01.corp.local@CORP.LOCAL
+      hdfs_protection     = optional(string, "PRIVACY") # Kerberos QOP: AUTHENTICATION | INTEGRITY | PRIVACY
+      s3_bucket           = optional(string)            # s3 source: bucket name (cross-account: see summary for the bucket policy)
+      azure_container_url = optional(string)            # azure-blob: https://<account>.blob.core.windows.net/<container>
     })
     destination = object({
       type                = string
@@ -255,8 +324,13 @@ variable "file_shares" {
   }
 
   validation {
-    condition     = alltrue([for f in values(var.file_shares) : contains(["nfs", "smb", "hdfs", "object-storage"], f.source.type)])
-    error_message = "file_shares.*.source.type must be nfs, smb, hdfs or object-storage."
+    condition     = alltrue([for f in values(var.file_shares) : contains(["nfs", "smb", "hdfs", "object-storage", "s3", "azure-blob"], f.source.type)])
+    error_message = "file_shares.*.source.type must be nfs, smb, hdfs, object-storage, s3 or azure-blob."
+  }
+
+  validation {
+    condition     = alltrue([for f in values(var.file_shares) : contains(["simple", "kerberos"], f.source.hdfs_auth) && contains(["AUTHENTICATION", "INTEGRITY", "PRIVACY"], f.source.hdfs_protection)])
+    error_message = "hdfs_auth must be simple or kerberos; hdfs_protection must be AUTHENTICATION, INTEGRITY or PRIVACY."
   }
 
   validation {
@@ -288,8 +362,11 @@ variable "servers" {
     })), {})
     staging_subnet_id         = optional(string) # default: first target private subnet
     replication_instance_type = optional(string, "t3.small")
-    use_private_ip            = optional(bool, true) # replicate over VPN / Direct Connect, not the internet
-    bandwidth_mbps            = optional(number, 0)  # 0 = no throttling
+    use_private_ip            = optional(bool, true)        # replicate over VPN / Direct Connect, not the internet
+    bandwidth_mbps            = optional(number, 0)         # 0 = no throttling
+    automate                  = optional(bool, false)       # run the MGN setup with the AWS CLI during apply (needs bash + aws CLI)
+    launch_disposition        = optional(string, "STOPPED") # STOPPED | STARTED: state of test/cutover instances at launch
+    right_sizing              = optional(string, "BASIC")   # BASIC | NONE: pick the EC2 type from source CPU/RAM
   })
   default = {}
 
@@ -301,6 +378,11 @@ variable "servers" {
   }
 
   validation {
+    condition     = contains(["STOPPED", "STARTED"], var.servers.launch_disposition) && contains(["BASIC", "NONE"], var.servers.right_sizing)
+    error_message = "servers.launch_disposition must be STOPPED or STARTED; servers.right_sizing must be BASIC or NONE."
+  }
+
+  validation {
     condition     = alltrue([for s in values(var.servers.inventory) : s.licensing == null || contains(["byol", "aws"], s.licensing)])
     error_message = "servers.inventory.*.licensing must be byol or aws."
   }
@@ -308,6 +390,152 @@ variable "servers" {
 
 variable "create_dms_service_roles" {
   description = "Create the account-level roles DMS requires (dms-vpc-role, dms-cloudwatch-logs-role). Set false if they already exist."
+  type        = bool
+  default     = true
+}
+
+# ============================================
+# SHARED: on-prem identity without static keys
+# ============================================
+
+variable "onprem_ca_certificate_pem" {
+  description = <<-EOT
+    PEM of the certificate authority that issues certificates to on-prem systems (Velero on your cluster, Jenkins, ...).
+    Enables IAM Roles Anywhere: those systems exchange a certificate for short-lived AWS credentials instead of
+    using access keys. Used by kubernetes.source_auth = "roles-anywhere" and pipelines with provider = "jenkins".
+  EOT
+  type        = string
+  default     = null
+}
+
+# ============================================
+# CONTAINER IMAGES -> ECR
+# ============================================
+
+variable "images" {
+  description = <<-EOT
+    Bring container images into ECR (migrate must include "images").
+      repositories: ECR repositories to create, e.g. ["shop/web", "shop/api"]
+      pull_through: prefix => upstream. Public registries are mirrored on first pull:
+                    docker-hub | quay | ghcr | gitlab | k8s | ecr-public | azure (needs registry_url).
+                    Docker Hub, GHCR, GitLab and Azure need secret_arn (name must start with "ecr-pullthroughcache/").
+      copy:         images from private registries (Harbor, Nexus, Artifactory, Docker registry) to copy, e.g.
+                    { from = "harbor.corp.local/shop/web:1.4.2", to = "shop/web" }. Target repositories are created
+                    and summary.images.copy_commands lists ready-to-run skopeo commands.
+  EOT
+  type = object({
+    repositories = optional(list(string), [])
+    pull_through = optional(map(object({
+      upstream     = string
+      registry_url = optional(string) # required for azure (myregistry.azurecr.io), optional override otherwise
+      secret_arn   = optional(string)
+    })), {})
+    copy           = optional(list(object({ from = string, to = string })), [])
+    immutable_tags = optional(bool) # default: true in production
+    keep_images    = optional(number, 50)
+  })
+  default = {}
+
+  validation {
+    condition     = alltrue([for p in values(var.images.pull_through) : contains(["docker-hub", "quay", "ghcr", "gitlab", "k8s", "ecr-public", "azure"], p.upstream)])
+    error_message = "images.pull_through.*.upstream must be docker-hub, quay, ghcr, gitlab, k8s, ecr-public or azure."
+  }
+
+  validation {
+    condition     = alltrue([for r in concat(var.images.repositories, [for c in var.images.copy : c.to]) : can(regex("^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$", r))])
+    error_message = "Repository names must be lowercase, e.g. shop/web."
+  }
+}
+
+# ============================================
+# KUBERNETES -> EKS (Velero)
+# ============================================
+
+variable "kubernetes" {
+  description = <<-EOT
+    Move workloads from on-prem Kubernetes (OpenShift, Rancher, Tanzu, kubeadm, k3s, ...) to EKS with Velero
+    (migrate must include "kubernetes"). The module creates the backup bucket and AWS access for both clusters,
+    and prints the Velero install, backup and restore commands.
+      target_cluster_name:  EKS cluster to restore into (default with target.platform_name: the platform's cluster)
+      target_auth:          pod-identity (needs the eks-pod-identity-agent add-on) | irsa
+      source_auth:          iam-user (access key created by you, never in state) | roles-anywhere (needs onprem_ca_certificate_pem)
+      namespaces:           namespaces to migrate ([] = all)
+      storage_class_map:    on-prem StorageClass => EKS StorageClass, e.g. { "vsphere-csi" = "gp3" }
+  EOT
+  type = object({
+    target_cluster_name   = optional(string)
+    target_auth           = optional(string, "pod-identity")
+    source_auth           = optional(string, "iam-user")
+    namespaces            = optional(list(string), [])
+    storage_class_map     = optional(map(string), {})
+    backup_retention_days = optional(number, 30)
+    velero_plugin_version = optional(string, "v1.10.0") # velero/velero-plugin-for-aws tag matching your Velero version
+  })
+  default = {}
+
+  validation {
+    condition     = contains(["pod-identity", "irsa"], var.kubernetes.target_auth) && contains(["iam-user", "roles-anywhere"], var.kubernetes.source_auth)
+    error_message = "kubernetes.target_auth must be pod-identity or irsa; kubernetes.source_auth must be iam-user or roles-anywhere."
+  }
+}
+
+# ============================================
+# CI/CD PIPELINES -> AWS
+# ============================================
+
+variable "pipelines" {
+  description = <<-EOT
+    Deploy roles for the CI/CD systems that will ship migrated apps. One entry per pipeline; no static keys anywhere.
+      provider: github | gitlab | bitbucket | circleci | azure-devops | jenkins | codebuild
+        github        repository = "owner/repo"                     (GitHub Actions OIDC)
+        gitlab        repository = "group/project", issuer_url for self-managed GitLab (default https://gitlab.com)
+        bitbucket     issuer_url, audience, subjects from Repository settings > OpenID Connect
+        circleci      issuer_url = "https://oidc.circleci.com/org/<org-id>", audience = "<org-id>", subjects
+        azure-devops  issuer_url = "https://vstoken.dev.azure.com/<org-id>", subjects = ["sc://<org>/<project>/<service-connection>"]
+        jenkins       on-prem / any CI with a client certificate: IAM Roles Anywhere (needs onprem_ca_certificate_pem);
+                      the certificate CN must equal the pipeline key
+        codebuild     AWS CodeBuild project building `repository` (GitHub / GitLab / Bitbucket via a CodeConnections connection)
+    Permissions are opt-in per pipeline: ECR push, ECS deploy, EKS deploy (namespace-scoped), S3 sync, extra policies.
+  EOT
+  type = map(object({
+    provider   = string
+    repository = optional(string)
+    branch     = optional(string, "main")
+    issuer_url = optional(string)
+    audience   = optional(string)
+    subjects   = optional(list(string), [])
+
+    ecr_push           = optional(bool, true)       # this module's ECR repositories (+ ecr_repositories)
+    ecr_repositories   = optional(list(string), []) # extra repository names in this account
+    ecs_clusters       = optional(list(string), []) # cluster names it may deploy to
+    ecs_pass_roles     = optional(list(string), []) # task / execution role ARNs it may pass
+    eks_clusters       = optional(list(string), []) # cluster names it may deploy to
+    eks_namespaces     = optional(list(string), []) # [] = whole cluster (edit, not admin)
+    s3_buckets         = optional(list(string), []) # buckets it may sync to
+    policy_arns        = optional(list(string), []) # anything else
+    codebuild_repo_url = optional(string)           # codebuild: https://github.com/owner/repo (or GitLab / Bitbucket)
+    codebuild_source   = optional(string, "GITHUB") # codebuild: GITHUB | GITLAB | BITBUCKET
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for k in keys(var.pipelines) : can(regex("^[a-z][a-z0-9-]{0,24}$", k))])
+    error_message = "Pipeline keys must be 1-25 lowercase letters, digits or hyphens."
+  }
+
+  validation {
+    condition     = alltrue([for p in values(var.pipelines) : contains(["github", "gitlab", "bitbucket", "circleci", "azure-devops", "jenkins", "codebuild"], p.provider)])
+    error_message = "pipelines.*.provider must be github, gitlab, bitbucket, circleci, azure-devops, jenkins or codebuild."
+  }
+
+  validation {
+    condition     = alltrue([for p in values(var.pipelines) : contains(["GITHUB", "GITLAB", "BITBUCKET"], p.codebuild_source)])
+    error_message = "pipelines.*.codebuild_source must be GITHUB, GITLAB or BITBUCKET."
+  }
+}
+
+variable "create_oidc_providers" {
+  description = "Create the IAM OIDC identity providers the pipelines need. Set false if they already exist in the account (they are looked up instead)."
   type        = bool
   default     = true
 }

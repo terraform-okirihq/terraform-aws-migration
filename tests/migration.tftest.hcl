@@ -24,7 +24,7 @@ mock_provider "aws" {
     defaults = { id = "fs-0123456789", arn = "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-0123456789" }
   }
   mock_data "aws_secretsmanager_secret_version" {
-    defaults = { secret_string = "{\"username\":\"svc\",\"password\":\"x\",\"access_key\":\"AKIAMOCKMOCK\",\"secret_key\":\"mocksecretmocksecret\"}" }
+    defaults = { secret_string = "{\"username\":\"svc\",\"password\":\"x\",\"access_key\":\"AKIAMOCKMOCK\",\"secret_key\":\"mocksecretmocksecret\",\"sas_token\":\"sv=2024&sig=mock\",\"keytab_base64\":\"BQIAAA==\",\"krb5_conf\":\"[libdefaults]\\n default_realm = CORP.LOCAL\"}" }
   }
   mock_data "aws_network_interface" {
     defaults = { private_ip = "10.0.1.10" }
@@ -98,6 +98,48 @@ mock_provider "aws" {
   }
   mock_resource "aws_datasync_location_fsx_windows_file_system" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:location/loc-0fsx" }
+  }
+  mock_resource "aws_datasync_location_azure_blob" {
+    defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:location/loc-0azure" }
+  }
+  mock_data "aws_eks_cluster" {
+    defaults = { identity = [{ oidc = [{ issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/MOCK" }] }] }
+  }
+  mock_data "aws_iam_openid_connect_provider" {
+    defaults = { arn = "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/MOCK" }
+  }
+  mock_resource "aws_ecr_repository" {
+    defaults = { arn = "arn:aws:ecr:us-east-1:123456789012:repository/mock", repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/mock" }
+  }
+  mock_resource "aws_iam_policy" {
+    defaults = { arn = "arn:aws:iam::123456789012:policy/mock" }
+  }
+  mock_resource "aws_iam_openid_connect_provider" {
+    defaults = { arn = "arn:aws:iam::123456789012:oidc-provider/mock" }
+  }
+  mock_resource "aws_rolesanywhere_trust_anchor" {
+    defaults = { arn = "arn:aws:rolesanywhere:us-east-1:123456789012:trust-anchor/mock" }
+  }
+  mock_resource "aws_rolesanywhere_profile" {
+    defaults = { arn = "arn:aws:rolesanywhere:us-east-1:123456789012:profile/mock" }
+  }
+  mock_resource "aws_codeconnections_connection" {
+    defaults = { arn = "arn:aws:codeconnections:us-east-1:123456789012:connection/mock" }
+  }
+  mock_resource "aws_codebuild_project" {
+    defaults = { arn = "arn:aws:codebuild:us-east-1:123456789012:project/mock" }
+  }
+  mock_data "aws_availability_zones" {
+    defaults = { names = ["us-east-1a", "us-east-1b", "us-east-1c"] }
+  }
+  mock_data "aws_route_tables" {
+    defaults = { ids = ["rtb-0aaaaaaaaaaaaaaaa", "rtb-0bbbbbbbbbbbbbbbb"] }
+  }
+  mock_resource "aws_ec2_transit_gateway" {
+    defaults = { id = "tgw-0mock0000000000", association_default_route_table_id = "tgw-rtb-0mock000000000" }
+  }
+  mock_resource "aws_flow_log" {
+    defaults = { arn = "arn:aws:ec2:us-east-1:123456789012:vpc-flow-log/fl-0mock" }
   }
   mock_resource "aws_datasync_task" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:task/task-0mock" }
@@ -243,6 +285,297 @@ run "production_on_platform_module" {
     condition     = length(aws_sns_topic_subscription.email) == 1
     error_message = "alert email should be subscribed"
   }
+}
+
+run "kerberos_hdfs_s3_and_azure_sources" {
+  command = apply
+
+  variables {
+    migrate         = ["files"]
+    target          = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"] }
+    datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
+    file_shares = {
+      warehouse = {
+        source      = { type = "hdfs", agent = "dc1", path = "/warehouse", hdfs_name_nodes = [{ host = "nn01.corp.local" }], hdfs_auth = "kerberos", kerberos_principal = "hdfs/nn01.corp.local@CORP.LOCAL", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:kerb-AbCdEf" }
+        destination = { type = "s3" }
+      }
+      oldaccount = {
+        source      = { type = "s3", s3_bucket = "legacy-account-bucket", path = "/" }
+        destination = { type = "s3", s3_bucket = "new-account-bucket" }
+      }
+      azure = {
+        source      = { type = "azure-blob", agent = "dc1", azure_container_url = "https://acme.blob.core.windows.net/media", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:sas-AbCdEf" }
+        destination = { type = "s3" }
+      }
+    }
+  }
+
+  assert {
+    condition     = aws_datasync_location_hdfs.source["warehouse"].authentication_type == "KERBEROS" && aws_datasync_location_hdfs.source["warehouse"].qop_configuration[0].rpc_protection == "PRIVACY"
+    error_message = "Kerberos HDFS with privacy protection"
+  }
+  assert {
+    condition     = length(aws_datasync_location_s3.source) == 1 && length(aws_datasync_location_azure_blob.source) == 1 && length(aws_datasync_task.main) == 3
+    error_message = "s3 and azure-blob sources should get locations and tasks"
+  }
+  assert {
+    condition     = strcontains(output.summary.files.oldaccount.source_bucket_policy, "legacy-account-bucket") && output.summary.files.azure.source_bucket_policy == null
+    error_message = "cross-account S3 sources get a ready-made bucket policy"
+  }
+}
+
+run "kerberos_needs_principal" {
+  command = plan
+  variables {
+    migrate         = ["files"]
+    target          = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
+    file_shares     = { w = { source = { type = "hdfs", agent = "dc1", hdfs_name_nodes = [{ host = "nn01" }], hdfs_auth = "kerberos", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:k-AbCdEf" }, destination = { type = "s3" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "servers_automation_script" {
+  command = plan
+
+  # Plan only: the script is rendered and checked, never executed.
+  override_resource {
+    target          = aws_security_group.mgn_replication[0]
+    override_during = plan
+    values          = { id = "sg-0mgnreplication000" }
+  }
+
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    servers = {
+      automate  = true
+      inventory = { web01 = { os = "windows", licensing = "byol" }, app01 = { os = "rhel" }, api01 = { os = "ubuntu" } }
+    }
+  }
+
+  assert {
+    condition     = length(terraform_data.mgn_setup) == 1
+    error_message = "automate = true should schedule the MGN setup"
+  }
+  assert {
+    condition     = strcontains(output.mgn_setup_script, "sg-0mgnreplication000") && strcontains(output.mgn_setup_script, "hostname=='web01'") && strcontains(output.mgn_setup_script, "osByol=true") && !strcontains(output.mgn_setup_script, "hostname=='api01'")
+    error_message = "script must use the replication SG and set licensing only for windows/rhel/suse servers"
+  }
+}
+
+run "images_kubernetes_and_every_ci_system" {
+  command = apply
+
+  variables {
+    migrate                   = ["images", "kubernetes"]
+    target                    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"] }
+    onprem_ca_certificate_pem = "-----BEGIN CERTIFICATE-----\nMIIBmock\n-----END CERTIFICATE-----"
+
+    images = {
+      repositories = ["shop/web"]
+      copy         = [{ from = "harbor.corp.local/shop/api:2.1", to = "shop/api" }]
+      pull_through = {
+        docker-hub = { upstream = "docker-hub", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:ecr-pullthroughcache/dockerhub-AbCdEf" }
+        k8s        = { upstream = "k8s" }
+      }
+    }
+
+    kubernetes = {
+      target_cluster_name = "prod-eks"
+      target_auth         = "irsa"
+      source_auth         = "roles-anywhere"
+      namespaces          = ["shop", "payments"]
+      storage_class_map   = { "vsphere-csi" = "gp3" }
+    }
+
+    pipelines = {
+      gh      = { provider = "github", repository = "acme/shop", eks_clusters = ["prod-eks"], eks_namespaces = ["shop"] }
+      gl      = { provider = "gitlab", repository = "platform/api", issuer_url = "https://gitlab.acme.internal", ecs_clusters = ["acme-prod"], ecs_pass_roles = ["arn:aws:iam::123456789012:role/acme-prod-api-task"] }
+      bb      = { provider = "bitbucket", issuer_url = "https://api.bitbucket.org/2.0/workspaces/acme/pipelines-config/identity/oidc", audience = "ari:cloud:bitbucket::workspace/1234", subjects = ["{repo-uuid}:*"] }
+      circle  = { provider = "circleci", issuer_url = "https://oidc.circleci.com/org/abc", audience = "abc", subjects = ["org/abc/project/def/user/*"] }
+      ado     = { provider = "azure-devops", issuer_url = "https://vstoken.dev.azure.com/0000", subjects = ["sc://acme/shop/aws-prod"] }
+      jenkins = { provider = "jenkins", s3_buckets = ["acme-artifacts"] }
+      cb      = { provider = "codebuild", codebuild_repo_url = "https://github.com/acme/shop" }
+    }
+  }
+
+  assert {
+    condition     = length(aws_ecr_repository.image) == 2 && length(aws_ecr_pull_through_cache_rule.upstream) == 2 && length(aws_ecr_repository_creation_template.pull_through) == 2
+    error_message = "two repositories (one from copy) and two pull-through caches"
+  }
+  assert {
+    condition     = contains(output.summary.images.copy_commands, "skopeo copy --all docker://harbor.corp.local/shop/api:2.1 docker://123456789012.dkr.ecr.us-east-1.amazonaws.com/shop/api:2.1")
+    error_message = "copy command must keep the tag"
+  }
+  assert {
+    condition     = aws_ecr_pull_through_cache_rule.upstream["k8s"].upstream_registry_url == "registry.k8s.io"
+    error_message = "k8s upstream URL"
+  }
+  assert {
+    condition     = length(aws_s3_bucket.velero) == 1 && strcontains(aws_iam_role.velero_target[0].assume_role_policy, "AssumeRoleWithWebIdentity") && length(aws_eks_pod_identity_association.velero) == 0
+    error_message = "IRSA target role for Velero"
+  }
+  assert {
+    condition     = length(aws_rolesanywhere_trust_anchor.onprem) == 1 && length(aws_rolesanywhere_profile.velero) == 1 && length(aws_iam_user.velero_source) == 0
+    error_message = "on-prem Velero via Roles Anywhere, no IAM user"
+  }
+  assert {
+    condition     = strcontains(output.summary.kubernetes.storage_class_configmap, "vsphere-csi: gp3") && anytrue([for c in output.summary.kubernetes.source_cluster : strcontains(c, "--include-namespaces shop,payments")])
+    error_message = "storage-class mapping and namespace filter"
+  }
+  assert {
+    condition     = length(aws_iam_role.ci) == 7 && length(aws_iam_openid_connect_provider.ci) == 5
+    error_message = "seven pipelines, five distinct OIDC issuers"
+  }
+  assert {
+    condition     = strcontains(aws_iam_role.ci["gh"].assume_role_policy, "repo:acme/shop:ref:refs/heads/main") && strcontains(aws_iam_role.ci["gl"].assume_role_policy, "project_path:platform/api:ref_type:branch:ref:main")
+    error_message = "default subjects pin the main branch"
+  }
+  assert {
+    condition     = length(aws_eks_access_entry.ci) == 1 && aws_eks_access_policy_association.ci["gh|prod-eks"].access_scope[0].type == "namespace"
+    error_message = "EKS deploy is namespace-scoped"
+  }
+  assert {
+    condition     = length(aws_codebuild_project.ci) == 1 && length(aws_rolesanywhere_profile.ci) == 1 && strcontains(output.summary.pipelines.gh.setup, "configure-aws-credentials")
+    error_message = "codebuild project, jenkins via Roles Anywhere, usage hints"
+  }
+}
+
+run "wildcard_ci_subject_refused" {
+  command = plan
+  variables {
+    migrate   = ["images"]
+    target    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    images    = { repositories = ["app"] }
+    pipelines = { any = { provider = "github", subjects = ["*"] } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "jenkins_needs_ca" {
+  command = plan
+  variables {
+    migrate   = ["images"]
+    target    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    images    = { repositories = ["app"] }
+    pipelines = { build = { provider = "jenkins" } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "docker_hub_cache_needs_prefixed_secret" {
+  command = plan
+  variables {
+    migrate = ["images"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    images  = { pull_through = { hub = { upstream = "docker-hub", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:dockerhub-AbCdEf" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "kubernetes_needs_target_cluster" {
+  command = plan
+  variables {
+    migrate = ["kubernetes"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "full_landing_zone_from_scratch" {
+  command = apply
+
+  variables {
+    profile     = "production"
+    alert_email = "migration@example.com"
+    migrate     = ["databases", "files", "servers"]
+    network     = { create = true, cidr = "10.50.0.0/16", az_count = 3, nat = "per_az" }
+    vpn         = { customer_gateway_ip = "198.51.100.10" }
+    dns         = { forward_domains = ["corp.local", "ad.corp.local"], onprem_dns_servers = ["10.20.0.2", "10.20.0.3"] }
+
+    databases       = { erp = { source = { engine = "sqlserver", database_name = "ERP", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-AbCdEf" }, target = { secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-tgt-AbCdEf" } } }
+    datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
+    file_shares     = { data = { source = { type = "nfs", agent = "dc1", host = "nas01.corp.local", path = "/data" }, destination = { type = "s3" } } }
+    servers         = { inventory = { web01 = { os = "windows" } } }
+  }
+
+  assert {
+    condition     = length(aws_vpc.this) == 1 && length(aws_subnet.private) == 3 && length(aws_subnet.public) == 3 && length(aws_nat_gateway.this) == 3
+    error_message = "3-AZ VPC with a NAT per AZ"
+  }
+  assert {
+    condition     = length(aws_vpc_endpoint.interface) == 12 && length(aws_vpc_endpoint.gateway) == 2 && length(aws_flow_log.this) == 1
+    error_message = "production adds private endpoints; gateway endpoints and flow logs always"
+  }
+  assert {
+    condition     = length(aws_vpn_gateway.this) == 1 && length(aws_vpn_gateway_route_propagation.private) == 3 && length(aws_vpn_connection_route.onprem) == 2
+    error_message = "VPN on a VGW, propagated to every private route table, static routes per on-prem CIDR"
+  }
+  assert {
+    condition     = contains(aws_vpn_connection.onprem[0].tunnel1_ike_versions, "ikev2") && !contains(aws_vpn_connection.onprem[0].tunnel1_phase1_encryption_algorithms, "AES128") && length(aws_cloudwatch_metric_alarm.vpn_down) == 1
+    error_message = "strong ciphers only, tunnel-down alarm"
+  }
+  assert {
+    condition     = length(aws_route53_resolver_rule.forward) == 2 && length(aws_route53_resolver_endpoint.inbound) == 1 && length(aws_route53_resolver_rule_association.forward) == 2
+    error_message = "hybrid DNS forwards both domains and offers an inbound endpoint"
+  }
+  assert {
+    condition     = length(aws_dms_replication_subnet_group.main[0].subnet_ids) == 3 && output.summary.network.created == true
+    error_message = "DMS runs in the module-built private subnets"
+  }
+}
+
+run "vpn_on_new_transit_gateway_with_bgp" {
+  command = apply
+
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"], route_table_ids = ["rtb-0aaaaaaaaaaaaaaaa", "rtb-0bbbbbbbbbbbbbbbb"] }
+    vpn     = { customer_gateway_ip = "203.0.113.7", attach = "tgw", routing = "bgp", bgp_asn = 65010 }
+    servers = { inventory = { app01 = { os = "rhel" } } }
+  }
+
+  assert {
+    condition     = length(aws_ec2_transit_gateway.this) == 1 && length(aws_ec2_transit_gateway_vpc_attachment.this) == 1 && length(aws_vpn_gateway.this) == 0
+    error_message = "TGW created and attached; no VGW"
+  }
+  assert {
+    condition     = length(aws_route.to_onprem_via_tgw) == 4 && length(aws_ec2_transit_gateway_route.onprem) == 0 && aws_vpn_connection.onprem[0].static_routes_only == false
+    error_message = "VPC routes to on-prem via TGW; BGP means no static TGW routes"
+  }
+}
+
+run "landing_network_must_be_one_choice" {
+  command = plan
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    network = { create = true }
+    servers = { inventory = { web01 = { os = "rhel" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "vpn_on_existing_vpc_needs_route_tables" {
+  command = plan
+  variables {
+    migrate = ["servers"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    vpn     = { customer_gateway_ip = "198.51.100.10" }
+    servers = { inventory = { web01 = { os = "rhel" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "no_nat_needs_endpoints" {
+  command = plan
+  variables {
+    migrate = ["servers"]
+    network = { create = true, nat = "none" }
+    servers = { inventory = { web01 = { os = "rhel" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
 }
 
 # ---------------------------------------------------------------- guardrails refuse bad input

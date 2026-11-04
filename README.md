@@ -1,7 +1,7 @@
 # AWS Migration Module
 
-[![Terraform CI](https://github.com/OkiriGabriel/terraform-aws-migration/actions/workflows/terraform-ci.yml/badge.svg)](https://github.com/OkiriGabriel/terraform-aws-migration/actions/workflows/terraform-ci.yml)
-[![Terraform Registry](https://img.shields.io/badge/Terraform%20Registry-OkiriGabriel%2Fmigration%2Faws-623CE4?logo=terraform)](https://registry.terraform.io/modules/OkiriGabriel/migration/aws)
+[![Terraform CI](https://github.com/terraform-aws-okirihq/terraform-aws-migration/actions/workflows/terraform-ci.yml/badge.svg)](https://github.com/terraform-aws-okirihq/terraform-aws-migration/actions/workflows/terraform-ci.yml)
+[![Terraform Registry](https://img.shields.io/badge/Terraform%20Registry-terraform--aws--okirihq%2Fmigration%2Faws-623CE4?logo=terraform)](https://registry.terraform.io/modules/terraform-aws-okirihq/migration/aws)
 [![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.5-623CE4?logo=terraform)](https://www.terraform.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -14,7 +14,7 @@ your target environment untouched.
 
 ```hcl
 module "migration" {
-  source  = "OkiriGabriel/migration/aws"
+  source  = "terraform-aws-okirihq/migration/aws"
   version = "~> 0.1"
 
   name         = "acme"
@@ -280,7 +280,7 @@ The plan stops with a clear message instead of failing halfway through an apply:
 
 ```hcl
 module "migration" {
-  source  = "OkiriGabriel/migration/aws"
+  source  = "terraform-aws-okirihq/migration/aws"
   version = "~> 0.1"
 
   name         = "acme"

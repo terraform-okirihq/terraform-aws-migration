@@ -141,3 +141,44 @@ locals {
     "aws mgn mark-as-archived --region ${local.region} --source-server-id <id>         # after the source is retired",
   ] : []
 }
+
+# --------------------------------------------
+# Optional: apply the MGN setup with the AWS CLI during terraform apply (servers.automate = true)
+# --------------------------------------------
+# Terraform has no MGN resources, so this runs the same commands as summary.servers.setup, idempotently:
+# initialize the service, create-or-update the replication and launch templates and, once agents have
+# connected, apply each server's licensing by matching its hostname. Re-apply after installing agents.
+# Requires bash and the AWS CLI v2 where Terraform runs, with permission to call MGN.
+
+locals {
+  mgn_automate = local.servers_on && var.servers.automate
+
+  mgn_licensing = { for k, s in local.server_plan : k => s.licensing == "byol" if contains(["windows", "rhel", "suse"], s.os) }
+
+  mgn_script = local.mgn_automate ? join("\n", concat([
+    "set -euo pipefail",
+    "R=${local.region}",
+    "aws mgn initialize-service --region $R >/dev/null 2>&1 || true",
+    "COMMON='--staging-area-subnet-id ${local.staging_subnet} --replication-servers-security-groups-ids ${aws_security_group.mgn_replication[0].id} --replication-server-instance-type ${var.servers.replication_instance_type} --use-dedicated-replication-server false --associate-default-security-group false --default-large-staging-disk-type GP3 --ebs-encryption DEFAULT --bandwidth-throttling ${var.servers.bandwidth_mbps} ${var.servers.use_private_ip ? "--data-plane-routing PRIVATE_IP --create-public-ip false" : "--data-plane-routing PUBLIC_IP --create-public-ip true"} --staging-area-tags Project=${var.name},Environment=${var.environment},ManagedBy=terraform'",
+    "RT=$(aws mgn describe-replication-configuration-templates --region $R --query 'items[0].replicationConfigurationTemplateID' --output text)",
+    "if [ \"$RT\" = \"None\" ] || [ -z \"$RT\" ]; then aws mgn create-replication-configuration-template --region $R $COMMON >/dev/null; else aws mgn update-replication-configuration-template --region $R --replication-configuration-template-id \"$RT\" $COMMON >/dev/null; fi",
+    "LAUNCH='--copy-private-ip false --copy-tags true --launch-disposition ${var.servers.launch_disposition} --target-instance-type-right-sizing-method ${var.servers.right_sizing}'",
+    "LT=$(aws mgn list-launch-configuration-templates --region $R --query 'items[0].launchConfigurationTemplateID' --output text 2>/dev/null || echo None)",
+    "if [ \"$LT\" = \"None\" ] || [ -z \"$LT\" ]; then aws mgn create-launch-configuration-template --region $R $LAUNCH >/dev/null; else aws mgn update-launch-configuration-template --region $R --launch-configuration-template-id \"$LT\" $LAUNCH >/dev/null; fi",
+    ], [for host, byol in local.mgn_licensing : join(" ", [
+      "ID=$(aws mgn describe-source-servers --region $R --query \"items[?sourceProperties.identificationHints.hostname=='${host}'] | [0].sourceServerID\" --output text);",
+      "if [ \"$ID\" != \"None\" ] && [ -n \"$ID\" ]; then aws mgn update-launch-configuration --region $R --source-server-id \"$ID\" --licensing osByol=${byol} >/dev/null && echo 'licensing set for ${host}'; else echo '${host}: agent not connected yet, re-apply after installing it'; fi",
+  ])])) : ""
+}
+
+resource "terraform_data" "mgn_setup" {
+  count = local.mgn_automate ? 1 : 0
+
+  # Re-run when any setting or the server inventory changes.
+  triggers_replace = [sha256(local.mgn_script)]
+
+  provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
+    command     = local.mgn_script
+  }
+}

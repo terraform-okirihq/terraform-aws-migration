@@ -82,6 +82,12 @@ jobs:
           terraform validate -no-color
 
 
+      - name: Validate schema-conversion submodule
+        working-directory: modules/schema-conversion
+        run: |
+          terraform init -backend=false
+          terraform validate -no-color
+
       - name: Validate examples
         run: |
           for e in examples/*/; do
@@ -112,6 +118,12 @@ jobs:
       # Mixed estate (every engine, share type and OS), production, and each guardrail, against a mocked provider:
       # no AWS credentials, nothing is created, no cost.
       - name: Module tests
+        run: |
+          terraform init -backend=false
+          terraform test -no-color
+
+      - name: Schema-conversion submodule tests
+        working-directory: modules/schema-conversion
         run: |
           terraform init -backend=false
           terraform test -no-color

@@ -276,9 +276,9 @@ resource "aws_dms_s3_endpoint" "target" {
   parquet_version                   = each.value.target.s3_format == "parquet" ? "parquet-2-0" : null
   compression_type                  = "GZIP"
   date_partition_enabled            = true
+  # Data is encrypted with SSE-KMS via server_side_encryption_kms_key_id (kms_key_arn is deprecated in provider v6).
   encryption_mode                   = local.kms_key_arn != null ? "SSE_KMS" : "SSE_S3"
   server_side_encryption_kms_key_id = local.kms_key_arn
-  kms_key_arn                       = local.kms_key_arn
 
   tags = merge(local.tags, { Database = each.key })
 

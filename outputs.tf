@@ -150,3 +150,12 @@ output "pipeline_role_arns" {
   description = "Deploy role ARN per pipeline."
   value       = { for k, r in aws_iam_role.ci : k => r.arn }
 }
+
+output "schema_conversion_network" {
+  description = "Pass to the schema-conversion submodule: network = module.migration.schema_conversion_network."
+  value = local.has.databases && length(local.dbs) > 0 ? {
+    subnet_group_id   = aws_dms_replication_subnet_group.main[0].id
+    security_group_id = aws_security_group.dms[0].id
+    kms_key_arn       = local.kms_key_arn
+  } : null
+}

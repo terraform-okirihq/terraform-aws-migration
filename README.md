@@ -5,9 +5,10 @@
 [![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.5-623CE4?logo=terraform)](https://www.terraform.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Move databases, file shares and servers from your data centre to AWS with one module. Tell it **what** to
-migrate and **where** it lands; it builds the AWS side of DMS, DataSync and Application Migration Service with
-secure defaults, and prints a step-by-step cutover runbook for every workload.
+Move databases, file shares, servers, container images and Kubernetes workloads from your data centre to AWS
+with one module, and set up the CI/CD that keeps shipping them. Tell it **what** to migrate and **where** it
+lands; it builds the AWS side of DMS, DataSync, Application Migration Service, ECR and Velero with secure
+defaults, creates keyless deploy roles for any CI system, and prints a step-by-step cutover runbook.
 
 Built to be temporary: when the cutover is done, `terraform destroy` removes all migration tooling and leaves
 your target environment untouched.
@@ -15,7 +16,7 @@ your target environment untouched.
 ```hcl
 module "migration" {
   source  = "terraform-aws-okirihq/migration/aws"
-  version = "~> 0.1"
+  version = "~> 0.2"
 
   name         = "acme"
   migrate      = ["databases", "files", "servers"]
@@ -48,6 +49,10 @@ module "migration" {
 - [Databases](#databases)
 - [Files](#files)
 - [Servers](#servers)
+- [Container images](#container-images)
+- [Kubernetes to EKS](#kubernetes-to-eks)
+- [CI/CD pipelines](#cicd-pipelines)
+- [Schema conversion](#schema-conversion)
 - [Profiles](#profiles)
 - [Guardrails](#guardrails)
 - [Outputs](#outputs)
@@ -63,8 +68,12 @@ module "migration" {
 | Workload | Sources | Lands on | AWS service |
 |:---------|:--------|:---------|:------------|
 | Databases | MySQL, MariaDB, PostgreSQL, Oracle, SQL Server, Db2, SAP ASE (Sybase), MongoDB | RDS / Aurora (MySQL, PostgreSQL), RDS for Oracle / SQL Server, DocumentDB, Redshift, S3 data lake | DMS (Serverless, or instance-based where Serverless doesn't apply) |
-| Files | NFS (Linux/Unix), SMB (Windows), HDFS (Hadoop), S3-compatible object storage (MinIO, StorageGRID, ...) | S3 (any storage class), EFS, FSx for Windows File Server | DataSync |
+| Schemas and code | Oracle, SQL Server, Db2, Sybase, MySQL, PostgreSQL, ... | PostgreSQL / Aurora, MySQL, ... | DMS Schema Conversion ([submodule](modules/schema-conversion)) |
+| Files | NFS (Linux/Unix), SMB (Windows), HDFS (Hadoop, simple or Kerberos), S3-compatible storage (MinIO, StorageGRID, GCS interop), S3 in another account or region, Azure Blob | S3 (any storage class), EFS, FSx for Windows File Server | DataSync |
 | Servers | Windows Server, RHEL, CentOS, Rocky, AlmaLinux, Oracle Linux, Amazon Linux, Ubuntu, Debian, SUSE | EC2 | Application Migration Service (MGN) |
+| Container images | Harbor, Nexus, Artifactory, any Docker registry; Docker Hub, Quay, GHCR, GitLab, registry.k8s.io, ECR Public, Azure (cached) | ECR | ECR + pull-through cache |
+| Kubernetes | OpenShift, Rancher, Tanzu, kubeadm, k3s, any conformant cluster | EKS | Velero (S3 + Pod Identity / IRSA) |
+| CI/CD | GitHub Actions, GitLab (SaaS or self-managed), Bitbucket, CircleCI, Azure DevOps, Jenkins / on-prem CI | Deploy roles for ECR, ECS, EKS, S3 | IAM OIDC, IAM Roles Anywhere, CodeBuild |
 
 Mix any of them: a Windows estate, a Linux estate, or both at once. See [examples](examples).
 
@@ -73,6 +82,8 @@ Mix any of them: a Windows estate, a Linux estate, or both at once. See [example
 | [windows-estate](examples/windows-estate/main.tf) | SQL Server, SMB shares into FSx for Windows, Windows Server with license-included and BYOL |
 | [linux-estate](examples/linux-estate/main.tf) | MySQL to Aurora, PostgreSQL with table filters, NFS into S3 and EFS, RHEL / Ubuntu / SUSE / Oracle Linux |
 | [mixed-estate](examples/mixed-estate/main.tf) | Production profile: Oracle to Aurora PostgreSQL, Sybase, MongoDB to DocumentDB, Db2 to S3, HDFS, MinIO |
+| [kubernetes-and-cicd](examples/kubernetes-and-cicd/main.tf) | OpenShift to EKS with Velero, Harbor + Docker Hub images into ECR, GitHub / GitLab / Jenkins deploy roles |
+| [schema-conversion](examples/schema-conversion/main.tf) | Oracle to Aurora PostgreSQL: convert the schema, then replicate the data |
 | [with-platform](examples/with-platform/main.tf) | Migrating into a stack built with [`OkiriGabriel/platform/aws`](https://registry.terraform.io/modules/OkiriGabriel/platform/aws) |
 
 ---
@@ -183,7 +194,7 @@ file_shares = {
 
 | Behaviour | Detail |
 |:----------|:-------|
-| Sources | `nfs`, `smb`, `hdfs` (simple auth), `object-storage` (S3-compatible, HTTPS) |
+| Sources | `nfs`, `smb`, `hdfs` (simple or Kerberos: principal, keytab and krb5.conf from Secrets Manager, QOP `PRIVACY` by default), `object-storage` (S3-compatible, HTTPS), `s3` (another account or region, no agent; `summary.files.<share>.source_bucket_policy` is the policy the source owner adds), `azure-blob` (SAS token) |
 | Destinations | `s3` (existing bucket, or one created with versioning, encryption, TLS-only policy, ACLs off), `efs` (TLS in transit), `fsx-windows` |
 | Transfers | Only changed data is copied; deleted files are preserved by default; verification defaults to `ONLY_FILES_TRANSFERRED` |
 | Bandwidth | `bandwidth_mbps` caps each task so business traffic keeps its share of the link |
@@ -197,6 +208,12 @@ file_shares = {
 AWS Application Migration Service (MGN) replicates whole servers block by block and launches them as EC2
 instances. **The AWS Terraform provider has no MGN resources**, so this module builds everything Terraform can
 and generates the exact commands for the rest:
+
+Set `servers.automate = true` and the module also **applies the MGN setup itself** during `terraform apply`
+(AWS CLI, idempotent): initializes the service, creates or updates the replication and launch templates
+(`launch_disposition`, `right_sizing`), and, once agents have connected, sets each server's licensing by
+hostname. Re-apply after installing agents. Needs `bash` and the AWS CLI where Terraform runs; the script is
+also in the `mgn_setup_script` output if you prefer to run it yourself or in CI.
 
 | Built by Terraform | Generated for you (in `summary.servers`) |
 |:-------------------|:-----------------------------------------|
@@ -221,6 +238,119 @@ servers = {
 
 Supported `os` values: `windows`, `rhel`, `centos`, `rocky`, `alma`, `oracle-linux`, `amazon-linux`, `ubuntu`,
 `debian`, `suse`.
+
+---
+
+## Container images
+
+```hcl
+migrate = ["images"]
+images = {
+  repositories = ["shop/worker"]
+  copy = [{ from = "harbor.corp.local/shop/web:3.2.0", to = "shop/web" }]   # Harbor / Nexus / Artifactory
+  pull_through = {
+    docker-hub = { upstream = "docker-hub", secret_arn = "arn:aws:secretsmanager:...:secret:ecr-pullthroughcache/dockerhub" }
+    k8s        = { upstream = "k8s" }       # registry.k8s.io, no credentials
+  }
+}
+```
+
+| Behaviour | Detail |
+|:----------|:-------|
+| Repositories | Scan on push, encryption (KMS in production), lifecycle (untagged after 14 days, keep the newest 50), immutable tags in production |
+| Pull-through cache | `<registry>/docker-hub/library/nginx:1.27` pulls through to Docker Hub once and serves from ECR afterwards; cached repositories get the same scanning, encryption and lifecycle |
+| Private registries | `summary.images.copy_commands` lists the `skopeo login` and `skopeo copy --all` commands (multi-arch safe), tags preserved |
+| Keeping them | Repositories are destinations (`Lifecycle = keep`); ECR refuses to delete one with images, so destroying the migration stack never loses them silently |
+
+---
+
+## Kubernetes to EKS
+
+```hcl
+migrate = ["kubernetes"]
+kubernetes = {
+  target_cluster_name = "prod-eks"          # default with target.platform_name: the platform's cluster
+  target_auth         = "pod-identity"      # pod-identity | irsa
+  source_auth         = "roles-anywhere"    # roles-anywhere (with onprem_ca_certificate_pem) | iam-user
+  namespaces          = ["shop", "payments"]
+  storage_class_map   = { "vsphere-csi" = "gp3", "ocs-storagecluster-ceph-rbd" = "gp3" }
+}
+```
+
+The module creates an encrypted, TLS-only backup bucket with expiry, a least-privilege Velero policy, and AWS
+access for both clusters without keys in Terraform state:
+
+- **EKS:** Pod Identity association (needs the `eks-pod-identity-agent` add-on) or an IRSA role bound to `velero/velero`.
+- **On-prem cluster:** IAM Roles Anywhere with a certificate from your CA, or an IAM user whose access key you
+  create from the printed command (the key never enters state; the user is removed with the stack).
+
+`summary.kubernetes` lists the exact `velero install`, `backup create`, `restore create` commands for each cluster,
+sets the EKS side read-only on the bucket, and gives the StorageClass-mapping ConfigMap for your storage classes.
+
+---
+
+## CI/CD pipelines
+
+One least-privilege deploy role per pipeline, for whichever CI system you run. No static access keys anywhere.
+
+```hcl
+pipelines = {
+  web      = { provider = "github", repository = "acme/web", eks_clusters = ["prod-eks"], eks_namespaces = ["shop"] }
+  payments = { provider = "gitlab", repository = "fin/payments", issuer_url = "https://gitlab.acme.internal", ecs_clusters = ["acme-prod"] }
+  mobile   = { provider = "bitbucket", issuer_url = "https://api.bitbucket.org/2.0/workspaces/acme/pipelines-config/identity/oidc", audience = "ari:cloud:bitbucket::workspace/<uuid>", subjects = ["{<repo-uuid>}:*"] }
+  data     = { provider = "circleci", issuer_url = "https://oidc.circleci.com/org/<org-id>", audience = "<org-id>", subjects = ["org/<org-id>/project/<project-id>/user/*"] }
+  erp      = { provider = "azure-devops", issuer_url = "https://vstoken.dev.azure.com/<org-id>", subjects = ["sc://acme/erp/aws-prod"] }
+  legacy   = { provider = "jenkins", s3_buckets = ["acme-artifacts"] }          # on-prem CI, certificate CN = "legacy"
+  build    = { provider = "codebuild", codebuild_repo_url = "https://github.com/acme/web" }
+}
+```
+
+| Provider | How it authenticates | Default trust |
+|:---------|:---------------------|:--------------|
+| `github` | OIDC (`token.actions.githubusercontent.com`) | `repo:<owner/repo>:ref:refs/heads/<branch>` |
+| `gitlab` | OIDC (gitlab.com or your self-managed URL) | `project_path:<group/project>:ref_type:branch:ref:<branch>` |
+| `bitbucket`, `circleci`, `azure-devops` | OIDC with your workspace / org issuer | the `subjects` you give |
+| `jenkins` (TeamCity, Bamboo, any on-prem CI) | IAM Roles Anywhere: client certificate from your CA | certificate CN = pipeline key |
+| `codebuild` | AWS CodeBuild project on a CodeConnections link to GitHub / GitLab / Bitbucket | the project itself |
+
+Permissions are opt-in per pipeline: `ecr_push` (this module's repositories, plus `ecr_repositories`),
+`ecs_clusters` + `ecs_pass_roles`, `eks_clusters` (EKS access entry with the **edit** policy, scoped to
+`eks_namespaces`, never cluster-admin), `s3_buckets`, and `policy_arns` for anything else.
+`summary.pipelines.<name>.setup` shows how to use the role from that CI system. Subjects starting with `*` are refused.
+
+Set `create_oidc_providers = false` if the OIDC providers already exist in the account (for example GitHub's,
+created by the platform module); they are looked up instead.
+
+---
+
+## Schema conversion
+
+Moving between engines (Oracle or SQL Server to PostgreSQL, Db2 to Aurora, ...) needs the schema and code
+converted before data is copied. The [schema-conversion submodule](modules/schema-conversion) sets up
+**DMS Schema Conversion** in the same private network, with the same secrets:
+
+```hcl
+module "schema_conversion" {
+  source  = "terraform-aws-okirihq/migration/aws//modules/schema-conversion"
+  version = "~> 0.2"
+
+  name    = "acme"
+  network = module.migration.schema_conversion_network
+
+  projects = {
+    hr = {
+      source = { engine = "oracle", host = "ora01.corp.local", port = 1521, database_name = "HRPROD", secret_arn = "..." }
+      target = { engine = "aurora-postgresql", host = "hr.cluster-x.rds.amazonaws.com", port = 5432, database_name = "hr", secret_arn = "..." }
+    }
+  }
+}
+```
+
+It creates a private instance profile, a data provider per endpoint, a migration project per pair, and an
+encrypted bucket for assessment reports and converted code. Then: open the project in the DMS console, run the
+assessment, convert, apply to the target, and replicate the data with the main module (`on_existing_tables = "keep"`).
+It uses the AWSCC provider (the only provider with these resources), so it is a separate submodule: the main
+module stays AWS-provider-only.
 
 ---
 
@@ -257,6 +387,10 @@ The plan stops with a clear message instead of failing halfway through an apply:
 | SMB / object storage / FSx without a credentials secret | Set `secret_arn` / `fsx_secret_arn` |
 | Both, or neither, of `target.platform_name` and `target.vpc_id` | Choose one |
 | `production` without `alert_email` | Set it |
+| Kerberos HDFS without a principal or secret | Set `kerberos_principal` and `secret_arn` |
+| `images` with nothing to create; Azure cache without `registry_url`; Docker Hub / GHCR / GitLab / Azure cache without an `ecr-pullthroughcache/` secret | Fix `images` |
+| `kubernetes` without a target cluster; `roles-anywhere` without `onprem_ca_certificate_pem` | Set them |
+| Pipelines without a repository / issuer / subjects, Jenkins without a CA, CodeBuild without a repo URL, a subject starting with `*` | Fix `pipelines` |
 | Unknown OS, engine, share type or mode | Use a supported value |
 
 ---
@@ -273,6 +407,11 @@ The plan stops with a clear message instead of failing halfway through an apply:
 | `mgn_installer_role_arn` | Role for short-lived agent install credentials |
 | `alerts_topic_arn` | SNS topic with every DMS / DataSync state change |
 | `kms_key_arn` | Key used for migration data |
+| `ecr_repositories` | Repository URL per migrated image |
+| `velero_bucket` | Velero backup bucket |
+| `pipeline_role_arns` | Deploy role per pipeline |
+| `mgn_setup_script` | The idempotent MGN setup script (`servers.automate`) |
+| `schema_conversion_network` | Input for the schema-conversion submodule |
 
 ---
 
@@ -281,7 +420,7 @@ The plan stops with a clear message instead of failing halfway through an apply:
 ```hcl
 module "migration" {
   source  = "terraform-aws-okirihq/migration/aws"
-  version = "~> 0.1"
+  version = "~> 0.2"
 
   name         = "acme"
   environment  = "prod"
@@ -309,14 +448,12 @@ The platform module already provides the network path (`vpn`, `client-vpn`, `tra
 
 ## Limitations
 
-- **MGN is not in the Terraform AWS provider.** Server replication settings and agent installs are run from the
-  generated commands, not by `terraform apply`.
-- **DataSync credentials in state.** DataSync requires SMB, FSx and object-storage credentials as resource
-  arguments, so those values (marked sensitive) are in Terraform state. Keep state encrypted and access-controlled.
-  Database credentials are not in state.
-- **Schema conversion is separate.** For heterogeneous moves (for example Oracle to PostgreSQL), convert the schema
-  first with AWS DMS Schema Conversion or SCT.
-- **HDFS** supports simple authentication; Kerberos is not configured by this module.
+- **Agent installs are on the servers.** MGN agents (and DataSync agent appliances) run on your machines; the
+  module generates the per-OS install commands and, with `servers.automate`, applies all MGN settings for you.
+- **Schema conversion runs in the console.** The submodule builds the project; the conversion itself (assess,
+  convert, review, apply) is interactive in DMS Schema Conversion.
+- **Secrets that end up in state:** DataSync SMB / FSx / object-storage / Azure / Kerberos credentials (provider
+  arguments, marked sensitive). Database, MGN, Velero and CI credentials are not in state.
 - **DataSync agents** are appliances you deploy on-prem (or on EC2); the module activates and uses them.
 - **Account-level DMS roles** (`dms-vpc-role`, `dms-cloudwatch-logs-role`) are created by default. Set
   `create_dms_service_roles = false` if your account already has them.
@@ -331,9 +468,10 @@ terraform init -backend=false
 terraform test
 ```
 
-The suite runs a mixed estate (seven database engines, four share types, five operating systems), a production
-deployment on the platform module, and every guardrail against a mocked AWS provider: no credentials, nothing
-created. CI runs on every push and pull request: format, TFLint, validate (module and all examples), tests,
+The suite runs a mixed estate (seven database engines, four share types, five operating systems), Kerberos /
+S3 / Azure sources, MGN automation, images + Kubernetes + all seven CI systems, a production deployment on the
+platform module, and every guardrail, against mocked providers: no credentials, nothing created. The
+schema-conversion submodule has its own suite (`cd modules/schema-conversion && terraform test`). CI runs on every push and pull request: format, TFLint, validate (module and all examples), tests,
 Gitleaks and Checkov.
 
 ---
@@ -348,10 +486,15 @@ Gitleaks and Checkov.
 ├── guardrails.tf      # Plan-time refusals
 ├── databases.tf       # DMS: roles, endpoints, serverless + instance replication, alerts
 ├── files.tf           # DataSync: agents, PrivateLink, locations, buckets, tasks, logs, alerts
-├── servers.tf         # MGN: replication security group, installer role, per-OS commands
+├── servers.tf         # MGN: replication security group, installer role, per-OS commands, optional CLI automation
+├── images.tf          # ECR repositories, pull-through caches, copy commands
+├── kubernetes.tf      # Velero bucket, EKS + on-prem access, runbook
+├── cicd.tf            # Deploy roles for GitHub, GitLab, Bitbucket, CircleCI, Azure DevOps, Jenkins, CodeBuild
 ├── outputs.tf         # summary runbook and building-block outputs
 ├── versions.tf
-├── examples/          # windows-estate, linux-estate, mixed-estate, with-platform
+├── modules/
+│   └── schema-conversion/   # DMS Schema Conversion (AWSCC provider)
+├── examples/          # windows-estate, linux-estate, mixed-estate, kubernetes-and-cicd, schema-conversion, with-platform
 └── tests/             # terraform test suite (mocked provider)
 ```
 

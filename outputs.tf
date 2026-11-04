@@ -19,8 +19,19 @@ locals {
   } }
 
   share_runbook = { for k, f in local.shares : k => {
-    route    = "${f.source.type}://${coalesce(f.source.host, "hdfs")}${f.source.path} -> ${f.destination.type}${f.destination.type == "s3" ? "://${local.dest_bucket_name[k]}${f.destination.path}" : ""}"
+    route    = "${f.source.type}://${coalesce(f.source.host, f.source.s3_bucket, f.source.azure_container_url, "hdfs")}${f.source.path} -> ${f.destination.type}${f.destination.type == "s3" ? "://${local.dest_bucket_name[k]}${f.destination.path}" : ""}"
     schedule = coalesce(f.schedule, "on demand")
+    # For an s3 source in another account: the bucket owner adds this to the source bucket's policy.
+    source_bucket_policy = f.source.type == "s3" ? jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Sid       = "AllowDataSyncMigrationRead"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.datasync_s3[0].arn }
+        Action    = ["s3:GetBucketLocation", "s3:ListBucket", "s3:GetObject", "s3:GetObjectTagging", "s3:GetObjectVersion", "s3:GetObjectVersionTagging"]
+        Resource  = ["arn:${local.partition}:s3:::${f.source.s3_bucket}", "arn:${local.partition}:s3:::${f.source.s3_bucket}/*"]
+      }]
+    }) : null
     commands = {
       run    = "aws datasync start-task-execution --region ${local.region} --task-arn ${aws_datasync_task.main[k].arn}"
       status = "aws datasync list-task-executions --region ${local.region} --task-arn ${aws_datasync_task.main[k].arn} --max-results 5"

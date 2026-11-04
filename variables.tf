@@ -211,25 +211,32 @@ variable "datasync_agents" {
 variable "file_shares" {
   description = <<-EOT
     One entry per share to copy.
-      source.type:      nfs (Linux/Unix) | smb (Windows) | hdfs | object-storage (S3-compatible: MinIO, NetApp StorageGRID, ...)
+      source.type:      nfs (Linux/Unix) | smb (Windows) | hdfs | object-storage (S3-compatible: MinIO, NetApp StorageGRID,
+                        Google Cloud Storage interop, ...) | s3 (another account or region, no agent) | azure-blob
       destination.type: s3 | efs | fsx-windows
-    Credentials (SMB, object storage, FSx) come from Secrets Manager JSON:
-      SMB / FSx: { "username": "...", "password": "..." }   Object storage: { "access_key": "...", "secret_key": "..." }
+    Credentials come from Secrets Manager JSON:
+      SMB / FSx: { "username": "...", "password": "..." }      Object storage: { "access_key": "...", "secret_key": "..." }
+      Azure Blob: { "sas_token": "..." }                        HDFS Kerberos: { "keytab_base64": "...", "krb5_conf": "..." }
   EOT
   type = map(object({
     source = object({
-      type             = string
-      agent            = string # key in datasync_agents
-      host             = optional(string)
-      path             = optional(string, "/") # export / share path, or bucket name for object-storage
-      nfs_version      = optional(string, "AUTOMATIC")
-      smb_domain       = optional(string)
-      smb_version      = optional(string, "AUTOMATIC")
-      secret_arn       = optional(string)
-      object_port      = optional(number, 443)
-      object_protocol  = optional(string, "HTTPS")
-      hdfs_name_nodes  = optional(list(object({ host = string, port = optional(number, 8020) })), [])
-      hdfs_simple_user = optional(string)
+      type                = string
+      agent               = optional(string) # key in datasync_agents (not needed for s3)
+      host                = optional(string)
+      path                = optional(string, "/") # export / share path, or bucket name for object-storage
+      nfs_version         = optional(string, "AUTOMATIC")
+      smb_domain          = optional(string)
+      smb_version         = optional(string, "AUTOMATIC")
+      secret_arn          = optional(string)
+      object_port         = optional(number, 443)
+      object_protocol     = optional(string, "HTTPS")
+      hdfs_name_nodes     = optional(list(object({ host = string, port = optional(number, 8020) })), [])
+      hdfs_simple_user    = optional(string)
+      hdfs_auth           = optional(string, "simple")  # simple | kerberos
+      kerberos_principal  = optional(string)            # e.g. hdfs/nn01.corp.local@CORP.LOCAL
+      hdfs_protection     = optional(string, "PRIVACY") # Kerberos QOP: AUTHENTICATION | INTEGRITY | PRIVACY
+      s3_bucket           = optional(string)            # s3 source: bucket name (cross-account: see summary for the bucket policy)
+      azure_container_url = optional(string)            # azure-blob: https://<account>.blob.core.windows.net/<container>
     })
     destination = object({
       type                = string
@@ -255,8 +262,13 @@ variable "file_shares" {
   }
 
   validation {
-    condition     = alltrue([for f in values(var.file_shares) : contains(["nfs", "smb", "hdfs", "object-storage"], f.source.type)])
-    error_message = "file_shares.*.source.type must be nfs, smb, hdfs or object-storage."
+    condition     = alltrue([for f in values(var.file_shares) : contains(["nfs", "smb", "hdfs", "object-storage", "s3", "azure-blob"], f.source.type)])
+    error_message = "file_shares.*.source.type must be nfs, smb, hdfs, object-storage, s3 or azure-blob."
+  }
+
+  validation {
+    condition     = alltrue([for f in values(var.file_shares) : contains(["simple", "kerberos"], f.source.hdfs_auth) && contains(["AUTHENTICATION", "INTEGRITY", "PRIVACY"], f.source.hdfs_protection)])
+    error_message = "hdfs_auth must be simple or kerberos; hdfs_protection must be AUTHENTICATION, INTEGRITY or PRIVACY."
   }
 
   validation {

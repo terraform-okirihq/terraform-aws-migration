@@ -4,7 +4,8 @@
 # Refuse unsafe or incomplete configurations before anything is created; each message says what to change.
 
 locals {
-  share_needs_secret = { for k, f in var.file_shares : k => contains(["smb", "object-storage"], f.source.type) }
+  share_needs_secret = { for k, f in var.file_shares : k => contains(["smb", "object-storage", "azure-blob"], f.source.type) || (f.source.type == "hdfs" && f.source.hdfs_auth == "kerberos") }
+  share_needs_agent  = { for k, f in var.file_shares : k => f.source.type != "s3" }
 }
 
 resource "terraform_data" "guardrails" {
@@ -84,8 +85,8 @@ resource "terraform_data" "guardrails" {
 
     # ---------------------------------------------------------- files
     precondition {
-      condition     = alltrue([for f in values(var.file_shares) : contains(keys(var.datasync_agents), f.source.agent)])
-      error_message = "Every file_shares.*.source.agent must name an entry in datasync_agents."
+      condition     = alltrue([for k, f in var.file_shares : !local.share_needs_agent[k] || contains(keys(var.datasync_agents), coalesce(f.source.agent, "-"))])
+      error_message = "Every file_shares.*.source.agent must name an entry in datasync_agents (all source types except s3 need an agent)."
     }
 
     precondition {
@@ -97,12 +98,17 @@ resource "terraform_data" "guardrails" {
 
     precondition {
       condition     = alltrue([for k, f in var.file_shares : !local.share_needs_secret[k] || f.source.secret_arn != null])
-      error_message = "SMB and object-storage sources need source.secret_arn (Secrets Manager JSON with the credentials)."
+      error_message = "SMB, object-storage, azure-blob and Kerberos HDFS sources need source.secret_arn (Secrets Manager JSON with the credentials)."
     }
 
     precondition {
-      condition     = alltrue([for f in values(var.file_shares) : f.source.type == "hdfs" ? length(f.source.hdfs_name_nodes) > 0 : f.source.host != null])
-      error_message = "nfs / smb / object-storage sources need source.host; hdfs sources need source.hdfs_name_nodes."
+      condition = alltrue([for f in values(var.file_shares) :
+        f.source.type == "hdfs" ? length(f.source.hdfs_name_nodes) > 0 && (f.source.hdfs_auth == "simple" || f.source.kerberos_principal != null) :
+        f.source.type == "s3" ? f.source.s3_bucket != null :
+        f.source.type == "azure-blob" ? f.source.azure_container_url != null :
+        f.source.host != null
+      ])
+      error_message = "nfs / smb / object-storage need source.host; hdfs needs hdfs_name_nodes (and kerberos_principal for Kerberos); s3 needs source.s3_bucket; azure-blob needs source.azure_container_url."
     }
 
     precondition {

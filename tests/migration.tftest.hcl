@@ -24,7 +24,7 @@ mock_provider "aws" {
     defaults = { id = "fs-0123456789", arn = "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-0123456789" }
   }
   mock_data "aws_secretsmanager_secret_version" {
-    defaults = { secret_string = "{\"username\":\"svc\",\"password\":\"x\",\"access_key\":\"AKIAMOCKMOCK\",\"secret_key\":\"mocksecretmocksecret\"}" }
+    defaults = { secret_string = "{\"username\":\"svc\",\"password\":\"x\",\"access_key\":\"AKIAMOCKMOCK\",\"secret_key\":\"mocksecretmocksecret\",\"sas_token\":\"sv=2024&sig=mock\",\"keytab_base64\":\"BQIAAA==\",\"krb5_conf\":\"[libdefaults]\\n default_realm = CORP.LOCAL\"}" }
   }
   mock_data "aws_network_interface" {
     defaults = { private_ip = "10.0.1.10" }
@@ -98,6 +98,9 @@ mock_provider "aws" {
   }
   mock_resource "aws_datasync_location_fsx_windows_file_system" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:location/loc-0fsx" }
+  }
+  mock_resource "aws_datasync_location_azure_blob" {
+    defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:location/loc-0azure" }
   }
   mock_resource "aws_datasync_task" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:task/task-0mock" }
@@ -243,6 +246,54 @@ run "production_on_platform_module" {
     condition     = length(aws_sns_topic_subscription.email) == 1
     error_message = "alert email should be subscribed"
   }
+}
+
+run "kerberos_hdfs_s3_and_azure_sources" {
+  command = apply
+
+  variables {
+    migrate         = ["files"]
+    target          = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"] }
+    datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
+    file_shares = {
+      warehouse = {
+        source      = { type = "hdfs", agent = "dc1", path = "/warehouse", hdfs_name_nodes = [{ host = "nn01.corp.local" }], hdfs_auth = "kerberos", kerberos_principal = "hdfs/nn01.corp.local@CORP.LOCAL", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:kerb-AbCdEf" }
+        destination = { type = "s3" }
+      }
+      oldaccount = {
+        source      = { type = "s3", s3_bucket = "legacy-account-bucket", path = "/" }
+        destination = { type = "s3", s3_bucket = "new-account-bucket" }
+      }
+      azure = {
+        source      = { type = "azure-blob", agent = "dc1", azure_container_url = "https://acme.blob.core.windows.net/media", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:sas-AbCdEf" }
+        destination = { type = "s3" }
+      }
+    }
+  }
+
+  assert {
+    condition     = aws_datasync_location_hdfs.source["warehouse"].authentication_type == "KERBEROS" && aws_datasync_location_hdfs.source["warehouse"].qop_configuration[0].rpc_protection == "PRIVACY"
+    error_message = "Kerberos HDFS with privacy protection"
+  }
+  assert {
+    condition     = length(aws_datasync_location_s3.source) == 1 && length(aws_datasync_location_azure_blob.source) == 1 && length(aws_datasync_task.main) == 3
+    error_message = "s3 and azure-blob sources should get locations and tasks"
+  }
+  assert {
+    condition     = strcontains(output.summary.files.oldaccount.source_bucket_policy, "legacy-account-bucket") && output.summary.files.azure.source_bucket_policy == null
+    error_message = "cross-account S3 sources get a ready-made bucket policy"
+  }
+}
+
+run "kerberos_needs_principal" {
+  command = plan
+  variables {
+    migrate         = ["files"]
+    target          = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
+    file_shares     = { w = { source = { type = "hdfs", agent = "dc1", hdfs_name_nodes = [{ host = "nn01" }], hdfs_auth = "kerberos", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:k-AbCdEf" }, destination = { type = "s3" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
 }
 
 # ---------------------------------------------------------------- guardrails refuse bad input

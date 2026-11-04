@@ -47,9 +47,11 @@ locals {
   }, var.tags)
 
   has = {
-    databases = contains(var.migrate, "databases")
-    files     = contains(var.migrate, "files")
-    servers   = contains(var.migrate, "servers")
+    databases  = contains(var.migrate, "databases")
+    files      = contains(var.migrate, "files")
+    servers    = contains(var.migrate, "servers")
+    images     = contains(var.migrate, "images")
+    kubernetes = contains(var.migrate, "kubernetes")
   }
 
   # Customer-managed key: bring your own, create one (production), or use AWS-managed keys (pilot).

@@ -67,13 +67,19 @@ output "summary" {
       cutover   = local.mgn_cutover
     } : null
 
+    images     = local.images_summary
+    kubernetes = local.kubernetes_summary
+    pipelines  = length(local.ci_usage) > 0 ? local.ci_usage : null
+
     next_steps = local.setup_steps
 
     cost_notes = compact([
       local.has.databases ? "DMS: Serverless bills per capacity-unit-hour (${local.s.dms_min_capacity_units}-${local.s.dms_max_capacity_units} DCU); instance-based bills per instance-hour (${local.s.dms_instance_class}). Stop replications you are not using." : "",
       local.has.files ? "DataSync: billed per GB copied; agents are free. Keep schedules only as long as you need re-syncs." : "",
       local.has.servers ? "MGN: free for 90 days of replication per server, then hourly; replication servers (${var.servers.replication_instance_type}) and staging EBS are billed as EC2." : "",
-      "Destroy this stack after cutover: it is tagged Lifecycle = temporary.",
+      local.has.images ? "ECR: storage per GB-month; pull-through caches only store what is pulled." : "",
+      local.has.kubernetes ? "Velero: S3 storage for backups (expire after ${var.kubernetes.backup_retention_days} days)." : "",
+      "Destroy this stack after cutover: migration tooling is tagged Lifecycle = temporary. Destinations it created (S3 buckets, ECR repositories, CI roles) are tagged Lifecycle = keep; move them out of this state first (terraform state rm) if you want to keep them.",
     ])
   }
 }
@@ -128,4 +134,19 @@ output "kms_key_arn" {
 output "mgn_setup_script" {
   description = "The idempotent MGN setup script (what servers.automate runs). Run it yourself, or in CI, if you prefer."
   value       = local.servers_on ? (var.servers.automate ? local.mgn_script : "Set servers.automate = true to generate the setup script; until then use summary.servers.setup.") : null
+}
+
+output "ecr_repositories" {
+  description = "ECR repository URLs created for migrated images."
+  value       = { for k, r in aws_ecr_repository.image : k => r.repository_url }
+}
+
+output "velero_bucket" {
+  description = "S3 bucket holding Velero migration backups."
+  value       = try(aws_s3_bucket.velero[0].bucket, null)
+}
+
+output "pipeline_role_arns" {
+  description = "Deploy role ARN per pipeline."
+  value       = { for k, r in aws_iam_role.ci : k => r.arn }
 }

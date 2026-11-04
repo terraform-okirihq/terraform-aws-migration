@@ -121,6 +121,65 @@ resource "terraform_data" "guardrails" {
       error_message = "fsx-windows destinations need destination.fsx_windows_arn and destination.fsx_secret_arn."
     }
 
+    # ---------------------------------------------------------- images
+    precondition {
+      condition     = !local.has.images || length(var.images.repositories) + length(var.images.copy) + length(var.images.pull_through) > 0
+      error_message = "migrate includes \"images\" but images has no repositories, copy or pull_through entries."
+    }
+
+    precondition {
+      condition     = alltrue([for p in values(var.images.pull_through) : p.upstream != "azure" || p.registry_url != null])
+      error_message = "images.pull_through with upstream = azure needs registry_url (e.g. myregistry.azurecr.io)."
+    }
+
+    precondition {
+      condition = alltrue([for p in values(var.images.pull_through) :
+        !contains(["docker-hub", "ghcr", "gitlab", "azure"], p.upstream) || can(regex(":secret:ecr-pullthroughcache/", coalesce(p.secret_arn, "-")))
+      ])
+      error_message = "Docker Hub, GHCR, GitLab and Azure pull-through caches need secret_arn for a Secrets Manager secret whose name starts with ecr-pullthroughcache/ (an ECR requirement)."
+    }
+
+    # ---------------------------------------------------------- kubernetes
+    precondition {
+      condition     = !local.has.kubernetes || try(var.kubernetes.target_cluster_name, null) != null || local.use_platform
+      error_message = "kubernetes needs target_cluster_name (the EKS cluster to restore into), or target.platform_name to use the platform's cluster."
+    }
+
+    precondition {
+      condition     = !local.has.kubernetes || var.kubernetes.source_auth != "roles-anywhere" || var.onprem_ca_certificate_pem != null
+      error_message = "kubernetes.source_auth = roles-anywhere needs onprem_ca_certificate_pem (the CA that issues the on-prem cluster's certificate)."
+    }
+
+    # ---------------------------------------------------------- pipelines
+    precondition {
+      condition = alltrue([for p in values(local.pipe) :
+        !contains(["github", "gitlab"], p.provider) || p.repository != null || length(p.subjects) > 0
+      ])
+      error_message = "github / gitlab pipelines need repository (\"owner/repo\" or \"group/project\") or explicit subjects."
+    }
+
+    precondition {
+      condition = alltrue([for p in values(local.pipe) :
+        !contains(["bitbucket", "circleci", "azure-devops"], p.provider) || (p.issuer_url != null && p.aud != null && length(p.subjects) > 0)
+      ])
+      error_message = "bitbucket / circleci / azure-devops pipelines need issuer_url, audience (azure-devops defaults to api://AzureADTokenExchange) and subjects."
+    }
+
+    precondition {
+      condition     = alltrue([for p in values(var.pipelines) : p.provider != "jenkins" || var.onprem_ca_certificate_pem != null])
+      error_message = "jenkins (on-prem CI) pipelines authenticate with a client certificate: set onprem_ca_certificate_pem."
+    }
+
+    precondition {
+      condition     = alltrue([for p in values(var.pipelines) : p.provider != "codebuild" || p.codebuild_repo_url != null])
+      error_message = "codebuild pipelines need codebuild_repo_url (e.g. https://github.com/owner/repo)."
+    }
+
+    precondition {
+      condition     = alltrue(flatten([for p in values(local.pipe) : [for s in p.subs : s != "*" && !startswith(s, "*")]]))
+      error_message = "A pipeline subject cannot start with *; that would let any repository assume the role."
+    }
+
     # ---------------------------------------------------------- servers
     precondition {
       condition     = !local.has.servers || length(var.servers.inventory) > 0

@@ -39,12 +39,12 @@ variable "profile" {
 }
 
 variable "migrate" {
-  description = "What to migrate: databases (DMS), files (DataSync), servers (Application Migration Service)."
+  description = "What to migrate: databases (DMS), files (DataSync), servers (MGN), images (container registries -> ECR), kubernetes (clusters -> EKS with Velero)."
   type        = set(string)
 
   validation {
-    condition     = length(var.migrate) > 0 && alltrue([for m in var.migrate : contains(["databases", "files", "servers"], m)])
-    error_message = "migrate must contain one or more of: databases, files, servers."
+    condition     = length(var.migrate) > 0 && alltrue([for m in var.migrate : contains(["databases", "files", "servers", "images", "kubernetes"], m)])
+    error_message = "migrate must contain one or more of: databases, files, servers, images, kubernetes."
   }
 }
 
@@ -328,6 +328,152 @@ variable "servers" {
 
 variable "create_dms_service_roles" {
   description = "Create the account-level roles DMS requires (dms-vpc-role, dms-cloudwatch-logs-role). Set false if they already exist."
+  type        = bool
+  default     = true
+}
+
+# ============================================
+# SHARED: on-prem identity without static keys
+# ============================================
+
+variable "onprem_ca_certificate_pem" {
+  description = <<-EOT
+    PEM of the certificate authority that issues certificates to on-prem systems (Velero on your cluster, Jenkins, ...).
+    Enables IAM Roles Anywhere: those systems exchange a certificate for short-lived AWS credentials instead of
+    using access keys. Used by kubernetes.source_auth = "roles-anywhere" and pipelines with provider = "jenkins".
+  EOT
+  type        = string
+  default     = null
+}
+
+# ============================================
+# CONTAINER IMAGES -> ECR
+# ============================================
+
+variable "images" {
+  description = <<-EOT
+    Bring container images into ECR (migrate must include "images").
+      repositories: ECR repositories to create, e.g. ["shop/web", "shop/api"]
+      pull_through: prefix => upstream. Public registries are mirrored on first pull:
+                    docker-hub | quay | ghcr | gitlab | k8s | ecr-public | azure (needs registry_url).
+                    Docker Hub, GHCR, GitLab and Azure need secret_arn (name must start with "ecr-pullthroughcache/").
+      copy:         images from private registries (Harbor, Nexus, Artifactory, Docker registry) to copy, e.g.
+                    { from = "harbor.corp.local/shop/web:1.4.2", to = "shop/web" }. Target repositories are created
+                    and summary.images.copy_commands lists ready-to-run skopeo commands.
+  EOT
+  type = object({
+    repositories = optional(list(string), [])
+    pull_through = optional(map(object({
+      upstream     = string
+      registry_url = optional(string) # required for azure (myregistry.azurecr.io), optional override otherwise
+      secret_arn   = optional(string)
+    })), {})
+    copy           = optional(list(object({ from = string, to = string })), [])
+    immutable_tags = optional(bool) # default: true in production
+    keep_images    = optional(number, 50)
+  })
+  default = {}
+
+  validation {
+    condition     = alltrue([for p in values(var.images.pull_through) : contains(["docker-hub", "quay", "ghcr", "gitlab", "k8s", "ecr-public", "azure"], p.upstream)])
+    error_message = "images.pull_through.*.upstream must be docker-hub, quay, ghcr, gitlab, k8s, ecr-public or azure."
+  }
+
+  validation {
+    condition     = alltrue([for r in concat(var.images.repositories, [for c in var.images.copy : c.to]) : can(regex("^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$", r))])
+    error_message = "Repository names must be lowercase, e.g. shop/web."
+  }
+}
+
+# ============================================
+# KUBERNETES -> EKS (Velero)
+# ============================================
+
+variable "kubernetes" {
+  description = <<-EOT
+    Move workloads from on-prem Kubernetes (OpenShift, Rancher, Tanzu, kubeadm, k3s, ...) to EKS with Velero
+    (migrate must include "kubernetes"). The module creates the backup bucket and AWS access for both clusters,
+    and prints the Velero install, backup and restore commands.
+      target_cluster_name:  EKS cluster to restore into (default with target.platform_name: the platform's cluster)
+      target_auth:          pod-identity (needs the eks-pod-identity-agent add-on) | irsa
+      source_auth:          iam-user (access key created by you, never in state) | roles-anywhere (needs onprem_ca_certificate_pem)
+      namespaces:           namespaces to migrate ([] = all)
+      storage_class_map:    on-prem StorageClass => EKS StorageClass, e.g. { "vsphere-csi" = "gp3" }
+  EOT
+  type = object({
+    target_cluster_name   = optional(string)
+    target_auth           = optional(string, "pod-identity")
+    source_auth           = optional(string, "iam-user")
+    namespaces            = optional(list(string), [])
+    storage_class_map     = optional(map(string), {})
+    backup_retention_days = optional(number, 30)
+    velero_plugin_version = optional(string, "v1.10.0") # velero/velero-plugin-for-aws tag matching your Velero version
+  })
+  default = {}
+
+  validation {
+    condition     = contains(["pod-identity", "irsa"], var.kubernetes.target_auth) && contains(["iam-user", "roles-anywhere"], var.kubernetes.source_auth)
+    error_message = "kubernetes.target_auth must be pod-identity or irsa; kubernetes.source_auth must be iam-user or roles-anywhere."
+  }
+}
+
+# ============================================
+# CI/CD PIPELINES -> AWS
+# ============================================
+
+variable "pipelines" {
+  description = <<-EOT
+    Deploy roles for the CI/CD systems that will ship migrated apps. One entry per pipeline; no static keys anywhere.
+      provider: github | gitlab | bitbucket | circleci | azure-devops | jenkins | codebuild
+        github        repository = "owner/repo"                     (GitHub Actions OIDC)
+        gitlab        repository = "group/project", issuer_url for self-managed GitLab (default https://gitlab.com)
+        bitbucket     issuer_url, audience, subjects from Repository settings > OpenID Connect
+        circleci      issuer_url = "https://oidc.circleci.com/org/<org-id>", audience = "<org-id>", subjects
+        azure-devops  issuer_url = "https://vstoken.dev.azure.com/<org-id>", subjects = ["sc://<org>/<project>/<service-connection>"]
+        jenkins       on-prem / any CI with a client certificate: IAM Roles Anywhere (needs onprem_ca_certificate_pem);
+                      the certificate CN must equal the pipeline key
+        codebuild     AWS CodeBuild project building `repository` (GitHub / GitLab / Bitbucket via a CodeConnections connection)
+    Permissions are opt-in per pipeline: ECR push, ECS deploy, EKS deploy (namespace-scoped), S3 sync, extra policies.
+  EOT
+  type = map(object({
+    provider   = string
+    repository = optional(string)
+    branch     = optional(string, "main")
+    issuer_url = optional(string)
+    audience   = optional(string)
+    subjects   = optional(list(string), [])
+
+    ecr_push           = optional(bool, true)       # this module's ECR repositories (+ ecr_repositories)
+    ecr_repositories   = optional(list(string), []) # extra repository names in this account
+    ecs_clusters       = optional(list(string), []) # cluster names it may deploy to
+    ecs_pass_roles     = optional(list(string), []) # task / execution role ARNs it may pass
+    eks_clusters       = optional(list(string), []) # cluster names it may deploy to
+    eks_namespaces     = optional(list(string), []) # [] = whole cluster (edit, not admin)
+    s3_buckets         = optional(list(string), []) # buckets it may sync to
+    policy_arns        = optional(list(string), []) # anything else
+    codebuild_repo_url = optional(string)           # codebuild: https://github.com/owner/repo (or GitLab / Bitbucket)
+    codebuild_source   = optional(string, "GITHUB") # codebuild: GITHUB | GITLAB | BITBUCKET
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for k in keys(var.pipelines) : can(regex("^[a-z][a-z0-9-]{0,24}$", k))])
+    error_message = "Pipeline keys must be 1-25 lowercase letters, digits or hyphens."
+  }
+
+  validation {
+    condition     = alltrue([for p in values(var.pipelines) : contains(["github", "gitlab", "bitbucket", "circleci", "azure-devops", "jenkins", "codebuild"], p.provider)])
+    error_message = "pipelines.*.provider must be github, gitlab, bitbucket, circleci, azure-devops, jenkins or codebuild."
+  }
+
+  validation {
+    condition     = alltrue([for p in values(var.pipelines) : contains(["GITHUB", "GITLAB", "BITBUCKET"], p.codebuild_source)])
+    error_message = "pipelines.*.codebuild_source must be GITHUB, GITLAB or BITBUCKET."
+  }
+}
+
+variable "create_oidc_providers" {
+  description = "Create the IAM OIDC identity providers the pipelines need. Set false if they already exist in the account (they are looked up instead)."
   type        = bool
   default     = true
 }

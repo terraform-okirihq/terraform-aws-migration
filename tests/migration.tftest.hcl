@@ -102,6 +102,33 @@ mock_provider "aws" {
   mock_resource "aws_datasync_location_azure_blob" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:location/loc-0azure" }
   }
+  mock_data "aws_eks_cluster" {
+    defaults = { identity = [{ oidc = [{ issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/MOCK" }] }] }
+  }
+  mock_data "aws_iam_openid_connect_provider" {
+    defaults = { arn = "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/MOCK" }
+  }
+  mock_resource "aws_ecr_repository" {
+    defaults = { arn = "arn:aws:ecr:us-east-1:123456789012:repository/mock", repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/mock" }
+  }
+  mock_resource "aws_iam_policy" {
+    defaults = { arn = "arn:aws:iam::123456789012:policy/mock" }
+  }
+  mock_resource "aws_iam_openid_connect_provider" {
+    defaults = { arn = "arn:aws:iam::123456789012:oidc-provider/mock" }
+  }
+  mock_resource "aws_rolesanywhere_trust_anchor" {
+    defaults = { arn = "arn:aws:rolesanywhere:us-east-1:123456789012:trust-anchor/mock" }
+  }
+  mock_resource "aws_rolesanywhere_profile" {
+    defaults = { arn = "arn:aws:rolesanywhere:us-east-1:123456789012:profile/mock" }
+  }
+  mock_resource "aws_codeconnections_connection" {
+    defaults = { arn = "arn:aws:codeconnections:us-east-1:123456789012:connection/mock" }
+  }
+  mock_resource "aws_codebuild_project" {
+    defaults = { arn = "arn:aws:codebuild:us-east-1:123456789012:project/mock" }
+  }
   mock_resource "aws_datasync_task" {
     defaults = { arn = "arn:aws:datasync:us-east-1:123456789012:task/task-0mock" }
   }
@@ -323,6 +350,125 @@ run "servers_automation_script" {
     condition     = strcontains(output.mgn_setup_script, "sg-0mgnreplication000") && strcontains(output.mgn_setup_script, "hostname=='web01'") && strcontains(output.mgn_setup_script, "osByol=true") && !strcontains(output.mgn_setup_script, "hostname=='api01'")
     error_message = "script must use the replication SG and set licensing only for windows/rhel/suse servers"
   }
+}
+
+run "images_kubernetes_and_every_ci_system" {
+  command = apply
+
+  variables {
+    migrate                   = ["images", "kubernetes"]
+    target                    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"] }
+    onprem_ca_certificate_pem = "-----BEGIN CERTIFICATE-----\nMIIBmock\n-----END CERTIFICATE-----"
+
+    images = {
+      repositories = ["shop/web"]
+      copy         = [{ from = "harbor.corp.local/shop/api:2.1", to = "shop/api" }]
+      pull_through = {
+        docker-hub = { upstream = "docker-hub", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:ecr-pullthroughcache/dockerhub-AbCdEf" }
+        k8s        = { upstream = "k8s" }
+      }
+    }
+
+    kubernetes = {
+      target_cluster_name = "prod-eks"
+      target_auth         = "irsa"
+      source_auth         = "roles-anywhere"
+      namespaces          = ["shop", "payments"]
+      storage_class_map   = { "vsphere-csi" = "gp3" }
+    }
+
+    pipelines = {
+      gh      = { provider = "github", repository = "acme/shop", eks_clusters = ["prod-eks"], eks_namespaces = ["shop"] }
+      gl      = { provider = "gitlab", repository = "platform/api", issuer_url = "https://gitlab.acme.internal", ecs_clusters = ["acme-prod"], ecs_pass_roles = ["arn:aws:iam::123456789012:role/acme-prod-api-task"] }
+      bb      = { provider = "bitbucket", issuer_url = "https://api.bitbucket.org/2.0/workspaces/acme/pipelines-config/identity/oidc", audience = "ari:cloud:bitbucket::workspace/1234", subjects = ["{repo-uuid}:*"] }
+      circle  = { provider = "circleci", issuer_url = "https://oidc.circleci.com/org/abc", audience = "abc", subjects = ["org/abc/project/def/user/*"] }
+      ado     = { provider = "azure-devops", issuer_url = "https://vstoken.dev.azure.com/0000", subjects = ["sc://acme/shop/aws-prod"] }
+      jenkins = { provider = "jenkins", s3_buckets = ["acme-artifacts"] }
+      cb      = { provider = "codebuild", codebuild_repo_url = "https://github.com/acme/shop" }
+    }
+  }
+
+  assert {
+    condition     = length(aws_ecr_repository.image) == 2 && length(aws_ecr_pull_through_cache_rule.upstream) == 2 && length(aws_ecr_repository_creation_template.pull_through) == 2
+    error_message = "two repositories (one from copy) and two pull-through caches"
+  }
+  assert {
+    condition     = contains(output.summary.images.copy_commands, "skopeo copy --all docker://harbor.corp.local/shop/api:2.1 docker://123456789012.dkr.ecr.us-east-1.amazonaws.com/shop/api:2.1")
+    error_message = "copy command must keep the tag"
+  }
+  assert {
+    condition     = aws_ecr_pull_through_cache_rule.upstream["k8s"].upstream_registry_url == "registry.k8s.io"
+    error_message = "k8s upstream URL"
+  }
+  assert {
+    condition     = length(aws_s3_bucket.velero) == 1 && strcontains(aws_iam_role.velero_target[0].assume_role_policy, "AssumeRoleWithWebIdentity") && length(aws_eks_pod_identity_association.velero) == 0
+    error_message = "IRSA target role for Velero"
+  }
+  assert {
+    condition     = length(aws_rolesanywhere_trust_anchor.onprem) == 1 && length(aws_rolesanywhere_profile.velero) == 1 && length(aws_iam_user.velero_source) == 0
+    error_message = "on-prem Velero via Roles Anywhere, no IAM user"
+  }
+  assert {
+    condition     = strcontains(output.summary.kubernetes.storage_class_configmap, "vsphere-csi: gp3") && anytrue([for c in output.summary.kubernetes.source_cluster : strcontains(c, "--include-namespaces shop,payments")])
+    error_message = "storage-class mapping and namespace filter"
+  }
+  assert {
+    condition     = length(aws_iam_role.ci) == 7 && length(aws_iam_openid_connect_provider.ci) == 5
+    error_message = "seven pipelines, five distinct OIDC issuers"
+  }
+  assert {
+    condition     = strcontains(aws_iam_role.ci["gh"].assume_role_policy, "repo:acme/shop:ref:refs/heads/main") && strcontains(aws_iam_role.ci["gl"].assume_role_policy, "project_path:platform/api:ref_type:branch:ref:main")
+    error_message = "default subjects pin the main branch"
+  }
+  assert {
+    condition     = length(aws_eks_access_entry.ci) == 1 && aws_eks_access_policy_association.ci["gh|prod-eks"].access_scope[0].type == "namespace"
+    error_message = "EKS deploy is namespace-scoped"
+  }
+  assert {
+    condition     = length(aws_codebuild_project.ci) == 1 && length(aws_rolesanywhere_profile.ci) == 1 && strcontains(output.summary.pipelines.gh.setup, "configure-aws-credentials")
+    error_message = "codebuild project, jenkins via Roles Anywhere, usage hints"
+  }
+}
+
+run "wildcard_ci_subject_refused" {
+  command = plan
+  variables {
+    migrate   = ["images"]
+    target    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    images    = { repositories = ["app"] }
+    pipelines = { any = { provider = "github", subjects = ["*"] } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "jenkins_needs_ca" {
+  command = plan
+  variables {
+    migrate   = ["images"]
+    target    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    images    = { repositories = ["app"] }
+    pipelines = { build = { provider = "jenkins" } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "docker_hub_cache_needs_prefixed_secret" {
+  command = plan
+  variables {
+    migrate = ["images"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    images  = { pull_through = { hub = { upstream = "docker-hub", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:dockerhub-AbCdEf" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "kubernetes_needs_target_cluster" {
+  command = plan
+  variables {
+    migrate = ["kubernetes"]
+    target  = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+  }
+  expect_failures = [terraform_data.guardrails]
 }
 
 # ---------------------------------------------------------------- guardrails refuse bad input

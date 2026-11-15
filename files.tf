@@ -330,6 +330,28 @@ resource "aws_s3_bucket_policy" "dest" {
   depends_on = [aws_s3_bucket_public_access_block.dest]
 }
 
+resource "aws_s3_bucket_logging" "dest" {
+  for_each      = aws_s3_bucket.dest
+  bucket        = each.value.id
+  target_bucket = aws_s3_bucket.access_logs[0].id
+  target_prefix = "files/${each.key}/"
+
+  depends_on = [aws_s3_bucket_policy.access_logs]
+}
+
+# ObjectRemoved only. DataSync writes one object per file, so notifying on every create would bill for the whole copy.
+resource "aws_s3_bucket_notification" "dest" {
+  for_each = aws_s3_bucket.dest
+  bucket   = each.value.id
+
+  topic {
+    topic_arn = aws_sns_topic.alerts.arn
+    events    = ["s3:ObjectRemoved:*"]
+  }
+
+  depends_on = [aws_sns_topic_policy.alerts]
+}
+
 locals {
   dest_bucket_name = merge(
     { for k, f in local.dest_s3 : k => f.destination.s3_bucket if f.destination.s3_bucket != null },

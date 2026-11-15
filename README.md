@@ -217,7 +217,7 @@ databases = {
 | Heterogeneous moves | Oracle / SQL Server / Db2 / Sybase into PostgreSQL or MySQL: convert the schema first with AWS DMS Schema Conversion or AWS SCT, then replicate the data with this module |
 | Validation | Production compares rows between source and target for relational targets |
 | S3 data lake | `target = { engine = "s3", s3_bucket = "lake", s3_folder = "db2/sales" }` writes Parquet (or CSV), date-partitioned, encrypted |
-| Network | DMS gets its own security group: out to `onprem_cidrs`, the VPC and AWS APIs only. Allow it on your target database's security group (automatic for the platform module's RDS) |
+| Network | DMS gets its own security group: the engine's port to `onprem_cidrs` and to targets in the VPC (set `source.port` / `target.port` when it is not the default), and HTTPS to AWS APIs. With interface endpoints that HTTPS stays on the VPC and the S3 prefix list; otherwise it uses NAT. Allow the group on your target database's security group (automatic for the platform module's RDS) |
 
 ---
 
@@ -270,7 +270,7 @@ also in the `mgn_setup_script` output if you prefer to run it yourself or in CI.
 |:-------------------|:-----------------------------------------|
 | Replication security group (TCP 1500 from `onprem_cidrs` only) | One-time `aws mgn initialize-service` |
 | Staging subnet choice | Replication template command with your subnet, security group, private routing, bandwidth |
-| Agent installer IAM role (short-lived credentials, no IAM user or static keys) | Credentials command (`aws sts assume-role` into that role) |
+| Agent installer IAM role (short-lived credentials, no IAM user or static keys). Production requires `installer_principal_arns`. Staging disks use the module KMS key when one exists | Credentials command (`aws sts assume-role` into that role) |
 | | **Per-server install command for its OS** (PowerShell for Windows, shell for Linux) |
 | | Kernel-header package hint per distro family (`yum`, `apt-get`, `zypper`) |
 | | Licensing command for Windows / RHEL / SUSE (`aws` license-included or `byol`) |
@@ -441,6 +441,7 @@ The plan stops with a clear message instead of failing halfway through an apply:
 | `dns` without domains / servers, or with fewer than two subnets | Fix `dns` |
 | `network.nat = "none"` without interface endpoints | Enable endpoints or keep a NAT |
 | `production` without `alert_email` | Set it |
+| `production` servers without `installer_principal_arns` | Name the IAM users or roles allowed to assume the agent installer role |
 | Kerberos HDFS without a principal or secret | Set `kerberos_principal` and `secret_arn` |
 | `images` with nothing to create; Azure cache without `registry_url`; Docker Hub / GHCR / GitLab / Azure cache without an `ecr-pullthroughcache/` secret | Fix `images` |
 | `kubernetes` without a target cluster; `roles-anywhere` without `onprem_ca_certificate_pem` | Set them |

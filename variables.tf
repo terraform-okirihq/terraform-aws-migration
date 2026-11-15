@@ -180,6 +180,7 @@ variable "databases" {
       engine                      = string
       secret_arn                  = string
       database_name               = optional(string)
+      port                        = optional(number)            # security-group port; default is the engine's (the secret still carries the port DMS uses)
       ssl_mode                    = optional(string, "require") # none | require | verify-ca | verify-full
       ca_certificate_pem          = optional(string)            # needed for verify-ca / verify-full and Oracle SSL
       extra_connection_attributes = optional(string)
@@ -188,6 +189,7 @@ variable "databases" {
       engine            = optional(string)
       secret_arn        = optional(string) # required unless engine = s3
       database_name     = optional(string)
+      port              = optional(number) # security-group port; default is the engine's
       ssl_mode          = optional(string, "require")
       platform_database = optional(bool, false) # open the platform module's RDS security group to DMS
       s3_bucket         = optional(string)      # engine = s3: existing bucket name
@@ -232,6 +234,14 @@ variable "databases" {
   validation {
     condition     = alltrue([for d in values(var.databases) : contains(["keep", "truncate", "drop"], d.on_existing_tables)])
     error_message = "databases.*.on_existing_tables must be keep, truncate or drop."
+  }
+
+  validation {
+    condition = alltrue(flatten([for d in values(var.databases) : [
+      d.source.port == null || (d.source.port >= 1 && d.source.port <= 65535),
+      d.target.port == null || (d.target.port >= 1 && d.target.port <= 65535),
+    ]]))
+    error_message = "databases.*.source.port and target.port must be between 1 and 65535. Set them when the database does not listen on its engine's default port; that port is what the security group allows."
   }
 
   validation {
@@ -354,13 +364,15 @@ variable "servers" {
     inventory: name => { os = windows | rhel | centos | rocky | alma | oracle-linux | ubuntu | debian | suse | amazon-linux }
     The module creates the AWS side (staging network, security group, encryption, installer role) and generates
     the exact install command for each server's OS.
+    installer_principal_arns: IAM users or roles allowed to assume the agent installer role. Required for production.
   EOT
   type = object({
     inventory = optional(map(object({
       os        = string
       licensing = optional(string) # windows / rhel / suse: byol | aws (license included). Default aws.
     })), {})
-    staging_subnet_id         = optional(string) # default: first target private subnet
+    installer_principal_arns  = optional(list(string), []) # required when profile = production
+    staging_subnet_id         = optional(string)           # default: first target private subnet
     replication_instance_type = optional(string, "t3.small")
     use_private_ip            = optional(bool, true)        # replicate over VPN / Direct Connect, not the internet
     bandwidth_mbps            = optional(number, 0)         # 0 = no throttling
@@ -385,6 +397,11 @@ variable "servers" {
   validation {
     condition     = alltrue([for s in values(var.servers.inventory) : s.licensing == null || contains(["byol", "aws"], s.licensing)])
     error_message = "servers.inventory.*.licensing must be byol or aws."
+  }
+
+  validation {
+    condition     = alltrue([for a in var.servers.installer_principal_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:(user|role)/", a))])
+    error_message = "servers.installer_principal_arns must be IAM user or role ARNs, e.g. arn:aws:iam::111122223333:role/migration-operator."
   }
 }
 

@@ -9,6 +9,10 @@ locals {
   servers_on     = local.has.servers
   staging_subnet = coalesce(var.servers.staging_subnet_id, local.first_subnet_id, "unset")
 
+  # Staging disks use the module key when one exists. DEFAULT is the AWS-managed EBS key (pilot).
+  mgn_ebs_encryption       = local.kms_key_arn != null ? "--ebs-encryption CUSTOM --ebs-encryption-key-arn ${local.kms_key_arn}" : "--ebs-encryption DEFAULT"
+  mgn_installer_principals = var.servers.installer_principal_arns
+
   os_family = {
     windows        = "windows"
     rhel           = "rhel"
@@ -81,13 +85,33 @@ resource "aws_vpc_security_group_ingress_rule" "mgn_agents" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "mgn_https" {
-  count             = local.servers_on ? 1 : 0
+  count             = local.servers_on && !local.endpoints_on ? 1 : 0
   security_group_id = aws_security_group.mgn_replication[0].id
-  description       = "MGN, EC2, S3 APIs"
+  description       = "MGN, EC2 and S3 APIs via NAT"
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
   cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "mgn_https_vpc" {
+  count             = local.servers_on && local.endpoints_on ? 1 : 0
+  security_group_id = aws_security_group.mgn_replication[0].id
+  description       = "MGN and EC2 APIs via interface endpoints"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = local.vpc_cidr
+}
+
+resource "aws_vpc_security_group_egress_rule" "mgn_https_s3" {
+  count             = local.servers_on && local.endpoints_on ? 1 : 0
+  security_group_id = aws_security_group.mgn_replication[0].id
+  description       = "S3 via the gateway endpoint"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  prefix_list_id    = data.aws_prefix_list.s3[0].id
 }
 
 # --------------------------------------------
@@ -100,11 +124,16 @@ resource "aws_iam_role" "mgn_installer" {
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = "arn:${local.partition}:iam::${local.account_id}:root" }
-      Action    = "sts:AssumeRole"
-    }]
+    Statement = [merge(
+      {
+        Effect = "Allow"
+        Principal = {
+          AWS = length(local.mgn_installer_principals) > 0 ? local.mgn_installer_principals : ["arn:${local.partition}:iam::${local.account_id}:root"]
+        }
+        Action = "sts:AssumeRole"
+      },
+      length(local.mgn_installer_principals) > 0 ? { Condition = { ArnEquals = { "aws:PrincipalArn" = local.mgn_installer_principals } } } : {}
+    )]
   })
 
   tags = local.tags
@@ -125,7 +154,7 @@ locals {
       "--replication-servers-security-groups-ids ${aws_security_group.mgn_replication[0].id}",
       "--replication-server-instance-type ${var.servers.replication_instance_type}",
       "--use-dedicated-replication-server false --associate-default-security-group false",
-      "--default-large-staging-disk-type GP3 --ebs-encryption DEFAULT",
+      "--default-large-staging-disk-type GP3 ${local.mgn_ebs_encryption}",
       "--bandwidth-throttling ${var.servers.bandwidth_mbps}",
       var.servers.use_private_ip ? "--data-plane-routing PRIVATE_IP --create-public-ip false" : "--data-plane-routing PUBLIC_IP --create-public-ip true",
       "--staging-area-tags Project=${var.name},Environment=${var.environment},ManagedBy=terraform",
@@ -159,7 +188,7 @@ locals {
     "set -euo pipefail",
     "R=${local.region}",
     "aws mgn initialize-service --region $R >/dev/null 2>&1 || true",
-    "COMMON='--staging-area-subnet-id ${local.staging_subnet} --replication-servers-security-groups-ids ${aws_security_group.mgn_replication[0].id} --replication-server-instance-type ${var.servers.replication_instance_type} --use-dedicated-replication-server false --associate-default-security-group false --default-large-staging-disk-type GP3 --ebs-encryption DEFAULT --bandwidth-throttling ${var.servers.bandwidth_mbps} ${var.servers.use_private_ip ? "--data-plane-routing PRIVATE_IP --create-public-ip false" : "--data-plane-routing PUBLIC_IP --create-public-ip true"} --staging-area-tags Project=${var.name},Environment=${var.environment},ManagedBy=terraform'",
+    "COMMON='--staging-area-subnet-id ${local.staging_subnet} --replication-servers-security-groups-ids ${aws_security_group.mgn_replication[0].id} --replication-server-instance-type ${var.servers.replication_instance_type} --use-dedicated-replication-server false --associate-default-security-group false --default-large-staging-disk-type GP3 ${local.mgn_ebs_encryption} --bandwidth-throttling ${var.servers.bandwidth_mbps} ${var.servers.use_private_ip ? "--data-plane-routing PRIVATE_IP --create-public-ip false" : "--data-plane-routing PUBLIC_IP --create-public-ip true"} --staging-area-tags Project=${var.name},Environment=${var.environment},ManagedBy=terraform'",
     "RT=$(aws mgn describe-replication-configuration-templates --region $R --query 'items[0].replicationConfigurationTemplateID' --output text)",
     "if [ \"$RT\" = \"None\" ] || [ -z \"$RT\" ]; then aws mgn create-replication-configuration-template --region $R $COMMON >/dev/null; else aws mgn update-replication-configuration-template --region $R --replication-configuration-template-id \"$RT\" $COMMON >/dev/null; fi",
     "LAUNCH='--copy-private-ip false --copy-tags true --launch-disposition ${var.servers.launch_disposition} --target-instance-type-right-sizing-method ${var.servers.right_sizing}'",

@@ -52,11 +52,23 @@ resource "aws_security_group" "datasync" {
   tags        = merge(local.tags, { Name = "${local.prefix}-datasync" })
 }
 
-resource "aws_vpc_security_group_egress_rule" "datasync_vpc" {
-  count             = local.has.files ? 1 : 0
+resource "aws_vpc_security_group_egress_rule" "datasync_efs" {
+  count             = length(local.dest_efs) > 0 ? 1 : 0
   security_group_id = aws_security_group.datasync[0].id
-  description       = "EFS / FSx inside the VPC"
-  ip_protocol       = "-1"
+  description       = "NFS to EFS in the VPC"
+  ip_protocol       = "tcp"
+  from_port         = 2049
+  to_port           = 2049
+  cidr_ipv4         = local.vpc_cidr
+}
+
+resource "aws_vpc_security_group_egress_rule" "datasync_fsx" {
+  count             = length(local.dest_fsx) > 0 ? 1 : 0
+  security_group_id = aws_security_group.datasync[0].id
+  description       = "SMB to FSx for Windows in the VPC"
+  ip_protocol       = "tcp"
+  from_port         = 445
+  to_port           = 445
   cidr_ipv4         = local.vpc_cidr
 }
 

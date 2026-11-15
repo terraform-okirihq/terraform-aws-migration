@@ -9,6 +9,11 @@ locals {
   db_targets     = { for k, d in local.dbs : k => d if d.target_engine != "s3" }
   db_ca_certs    = { for k, d in local.dbs : k => d.source.ca_certificate_pem if d.source.ca_certificate_pem != null }
 
+  # Security-group ports follow the engines in use (or an explicit port). The listening port inside the
+  # secret is what DMS connects to; set source.port / target.port when it is not the engine default.
+  dms_source_ports = distinct([for d in values(local.dbs) : coalesce(d.source.port, local.engine_port[d.source.engine])])
+  dms_target_ports = distinct([for d in values(local.db_targets) : coalesce(d.target.port, local.engine_port[d.target_engine])])
+
   table_mappings = { for k, d in local.dbs : k => jsonencode({
     rules = concat(
       [for i, r in d.include : {
@@ -52,34 +57,57 @@ resource "aws_security_group" "dms" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "dms_onprem" {
-  for_each = local.has.databases ? toset(var.onprem_cidrs) : toset([])
+  for_each = local.has.databases ? { for pair in setproduct(var.onprem_cidrs, local.dms_source_ports) : "${pair[0]}|${pair[1]}" => pair } : {}
 
   security_group_id = aws_security_group.dms[0].id
-  description       = "On-prem database sources"
+  description       = "On-prem database port ${each.value[1]}"
   ip_protocol       = "tcp"
-  from_port         = 1
-  to_port           = 65535
-  cidr_ipv4         = each.value
+  from_port         = each.value[1]
+  to_port           = each.value[1]
+  cidr_ipv4         = each.value[0]
 }
 
 resource "aws_vpc_security_group_egress_rule" "dms_vpc" {
-  count             = local.has.databases ? 1 : 0
+  for_each = local.has.databases ? toset([for p in local.dms_target_ports : tostring(p)]) : toset([])
+
   security_group_id = aws_security_group.dms[0].id
-  description       = "AWS targets inside the VPC"
+  description       = "AWS database targets on port ${each.value}"
   ip_protocol       = "tcp"
-  from_port         = 1
-  to_port           = 65535
+  from_port         = tonumber(each.value)
+  to_port           = tonumber(each.value)
   cidr_ipv4         = local.vpc_cidr
 }
 
+# Interface endpoints cover AWS APIs inside the VPC; S3 stays on the gateway-endpoint prefix list.
+# Without those endpoints (pilot, or an existing VPC) HTTPS still leaves via NAT.
 resource "aws_vpc_security_group_egress_rule" "dms_https" {
-  count             = local.has.databases ? 1 : 0
+  count             = local.has.databases && !local.endpoints_on ? 1 : 0
   security_group_id = aws_security_group.dms[0].id
-  description       = "AWS APIs (Secrets Manager, S3, KMS) via NAT or VPC endpoints"
+  description       = "AWS APIs (Secrets Manager, S3, KMS) via NAT"
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
   cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "dms_https_vpc" {
+  count             = local.has.databases && local.endpoints_on ? 1 : 0
+  security_group_id = aws_security_group.dms[0].id
+  description       = "AWS APIs via interface endpoints"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = local.vpc_cidr
+}
+
+resource "aws_vpc_security_group_egress_rule" "dms_https_s3" {
+  count             = local.has.databases && local.endpoints_on ? 1 : 0
+  security_group_id = aws_security_group.dms[0].id
+  description       = "S3 via the gateway endpoint"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  prefix_list_id    = data.aws_prefix_list.s3[0].id
 }
 
 # --------------------------------------------

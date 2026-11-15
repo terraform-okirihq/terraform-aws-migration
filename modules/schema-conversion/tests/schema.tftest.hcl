@@ -65,6 +65,10 @@ run "oracle_and_sqlserver_to_postgres" {
     condition     = awscc_dms_instance_profile.this.publicly_accessible == false
     error_message = "instance profile must be private"
   }
+  assert {
+    condition     = aws_s3_bucket_ownership_controls.artifacts.rule[0].object_ownership == "BucketOwnerEnforced" && strcontains(aws_s3_bucket_policy.artifacts.policy, "aws:SecureTransport") && strcontains(aws_iam_role.sc.assume_role_policy, "aws:SourceAccount")
+    error_message = "artifacts bucket is TLS-only and bucket-owner enforced; DMS may assume the role only from this account"
+  }
 }
 
 run "refuses_plaintext_credentials" {

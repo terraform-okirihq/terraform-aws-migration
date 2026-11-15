@@ -152,6 +152,9 @@ locals {
     "aurora-postgresql" = 5432
     sqlserver           = 1433
     oracle              = 1521
+    db2                 = 50000
+    sybase              = 5000
+    mongodb             = 27017
     docdb               = 27017
     redshift            = 5439
   }

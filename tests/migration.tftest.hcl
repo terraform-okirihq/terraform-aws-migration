@@ -29,6 +29,9 @@ mock_provider "aws" {
   mock_data "aws_network_interface" {
     defaults = { private_ip = "10.0.1.10" }
   }
+  mock_data "aws_prefix_list" {
+    defaults = { id = "pl-63a5400a", cidr_blocks = ["3.5.0.0/19"] }
+  }
 
   mock_resource "aws_kms_key" {
     defaults = { arn = "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000" }
@@ -236,6 +239,22 @@ run "mixed_estate_every_engine_share_and_os" {
   assert {
     condition     = length(aws_kms_key.migration) == 0 && length(aws_vpc_endpoint.datasync) == 0
     error_message = "pilot uses AWS-managed keys and no PrivateLink"
+  }
+  assert {
+    condition     = contains([for r in aws_vpc_security_group_egress_rule.dms_onprem : r.from_port], 3306) && contains([for r in aws_vpc_security_group_egress_rule.dms_onprem : r.from_port], 50000) && alltrue([for r in aws_vpc_security_group_egress_rule.dms_onprem : r.from_port != 1])
+    error_message = "DMS may leave for on-prem only on the ports of the engines being migrated"
+  }
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.dms_https[0].cidr_ipv4 == "0.0.0.0/0" && length(aws_vpc_security_group_egress_rule.dms_https_vpc) == 0
+    error_message = "without interface endpoints, DMS still needs HTTPS via NAT"
+  }
+  assert {
+    condition     = length(aws_vpc_security_group_egress_rule.datasync_fsx) == 1 && aws_vpc_security_group_egress_rule.datasync_fsx[0].from_port == 445 && length(aws_vpc_security_group_egress_rule.datasync_efs) == 0
+    error_message = "DataSync egress is SMB 445 when the only in-VPC destination is FSx"
+  }
+  assert {
+    condition     = strcontains(output.summary.servers.setup["2_replication_template"], "--ebs-encryption DEFAULT") && !strcontains(output.summary.servers.setup["2_replication_template"], "CUSTOM")
+    error_message = "pilot staging disks use the AWS-managed EBS key"
   }
 }
 
@@ -497,7 +516,10 @@ run "full_landing_zone_from_scratch" {
     databases       = { erp = { source = { engine = "sqlserver", database_name = "ERP", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-AbCdEf" }, target = { secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-tgt-AbCdEf" } } }
     datasync_agents = { dc1 = { activation_key = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" } }
     file_shares     = { data = { source = { type = "nfs", agent = "dc1", host = "nas01.corp.local", path = "/data" }, destination = { type = "s3" } } }
-    servers         = { inventory = { web01 = { os = "windows" } } }
+    servers = {
+      installer_principal_arns = ["arn:aws:iam::123456789012:role/migration-operator"]
+      inventory                = { web01 = { os = "windows" } }
+    }
   }
 
   assert {
@@ -523,6 +545,14 @@ run "full_landing_zone_from_scratch" {
   assert {
     condition     = length(aws_dms_replication_subnet_group.main[0].subnet_ids) == 3 && output.summary.network.created == true
     error_message = "DMS runs in the module-built private subnets"
+  }
+  assert {
+    condition     = length(aws_vpc_security_group_egress_rule.dms_https) == 0 && length(aws_vpc_security_group_egress_rule.dms_https_vpc) == 1 && aws_vpc_security_group_egress_rule.dms_https_s3[0].prefix_list_id == "pl-63a5400a" && length(aws_vpc_security_group_egress_rule.mgn_https) == 0 && length(aws_vpc_security_group_egress_rule.mgn_https_s3) == 1
+    error_message = "with interface endpoints, DMS and MGN HTTPS stays on the VPC and the S3 prefix list"
+  }
+  assert {
+    condition     = strcontains(output.summary.servers.setup["2_replication_template"], "--ebs-encryption CUSTOM") && strcontains(output.summary.servers.setup["2_replication_template"], "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000")
+    error_message = "production staging disks must use the module KMS key"
   }
 }
 
@@ -626,6 +656,18 @@ run "mongodb_cannot_target_relational" {
     migrate   = ["databases"]
     target    = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"] }
     databases = { x = { source = { engine = "mongodb", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:x-AbCdEf" }, target = { engine = "postgres", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:t-AbCdEf" } } }
+  }
+  expect_failures = [terraform_data.guardrails]
+}
+
+run "production_servers_need_installer_principals" {
+  command = plan
+  variables {
+    profile     = "production"
+    alert_email = "migration@example.com"
+    migrate     = ["servers"]
+    target      = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    servers     = { inventory = { web01 = { os = "windows" } } }
   }
   expect_failures = [terraform_data.guardrails]
 }

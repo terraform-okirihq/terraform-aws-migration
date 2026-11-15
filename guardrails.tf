@@ -211,5 +211,10 @@ resource "terraform_data" "guardrails" {
       condition     = alltrue([for s in values(var.servers.inventory) : s.licensing == null || contains(["windows", "rhel", "suse"], s.os)])
       error_message = "licensing applies only to windows, rhel and suse servers."
     }
+
+    precondition {
+      condition     = !local.has.servers || !local.s.require_alert_email || length(var.servers.installer_principal_arns) > 0
+      error_message = "Production needs servers.installer_principal_arns (the IAM users or roles allowed to assume the agent installer role). The role is not open to every principal in the account."
+    }
   }
 }

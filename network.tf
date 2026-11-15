@@ -159,6 +159,12 @@ resource "aws_vpc_endpoint" "interface" {
   tags                = merge(local.tags, { Name = "${local.prefix}-${each.key}" })
 }
 
+# S3 uses a gateway endpoint, so security groups must allow its prefix list rather than the VPC CIDR.
+data "aws_prefix_list" "s3" {
+  count = local.endpoints_on && (local.has.databases || local.has.servers) ? 1 : 0
+  name  = "com.amazonaws.${local.region}.s3"
+}
+
 resource "aws_cloudwatch_log_group" "flow" {
   count             = local.create_vpc ? 1 : 0
   name              = "/${local.prefix}/vpc-flow-logs"

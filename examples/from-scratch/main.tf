@@ -45,8 +45,9 @@ module "migration" {
   }
 
   servers = {
-    automate  = true
-    inventory = { web01 = { os = "windows" }, app01 = { os = "rhel" }, api01 = { os = "ubuntu" } }
+    automate                 = true
+    installer_principal_arns = ["arn:aws:iam::111122223333:role/migration-operator"]
+    inventory                = { web01 = { os = "windows" }, app01 = { os = "rhel" }, api01 = { os = "ubuntu" } }
   }
 }
 

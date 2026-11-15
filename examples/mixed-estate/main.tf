@@ -62,6 +62,7 @@ module "migration" {
   }
 
   servers = {
+    installer_principal_arns = ["arn:aws:iam::111122223333:role/migration-operator"]
     inventory = {
       dc01  = { os = "windows", licensing = "byol" }
       web01 = { os = "rhel" }

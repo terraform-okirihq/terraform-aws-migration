@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- MGN staging disks use the customer-managed key when the module has one.
+- DMS security groups allow only each engine's port (or `source.port` / `target.port`). HTTPS to the internet remains only when this module is not creating interface endpoints; DataSync egress is NFS 2049 or SMB 445.
+- Production requires `servers.installer_principal_arns` so the agent installer role is not assumable by every principal in the account.
+- The KMS key policy and the schema-conversion role require the caller's account. The schema-conversion bucket denies non-TLS access and enforces bucket-owner ownership.
+
 ## 0.2.0
 
 - **Landing network:** `network.create` builds a VPC (2-4 AZs, NAT none / single / per AZ, gateway and optional

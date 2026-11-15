@@ -37,6 +37,7 @@ resource "aws_kms_key" "migration" {
         Principal = { Service = ["events.amazonaws.com", "cloudwatch.amazonaws.com"] }
         Action    = ["kms:Decrypt", "kms:GenerateDataKey*"]
         Resource  = "*"
+        Condition = { StringEquals = { "aws:SourceAccount" = local.account_id } }
       }
     ]
   })

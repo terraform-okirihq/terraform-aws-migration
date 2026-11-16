@@ -38,6 +38,23 @@ resource "aws_kms_key" "migration" {
         Action    = ["kms:Decrypt", "kms:GenerateDataKey*"]
         Resource  = "*"
         Condition = { StringEquals = { "aws:SourceAccount" = local.account_id } }
+      },
+      {
+        # MGN encrypts replication staging disks with this key (--ebs-encryption CUSTOM). Its service-linked
+        # roles may use the key only through EC2/EBS. Matched by condition, not principal, so the policy is
+        # valid before MGN is initialized and its roles exist.
+        Sid       = "MgnStagingDisksViaEbs"
+        Effect    = "Allow"
+        Principal = { AWS = "*" }
+        Action    = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey", "kms:CreateGrant"]
+        Resource  = "*"
+        Condition = {
+          StringEquals = {
+            "kms:CallerAccount" = local.account_id
+            "kms:ViaService"    = "ec2.${local.region}.amazonaws.com"
+          }
+          ArnLike = { "aws:PrincipalArn" = "arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/mgn.amazonaws.com/*" }
+        }
       }
     ]
   })
@@ -105,6 +122,7 @@ locals {
 
 resource "aws_s3_bucket" "access_logs" {
   # checkov:skip=CKV_AWS_145: S3 server access log delivery does not support SSE-KMS
+  # checkov:skip=CKV_AWS_18: This is the log destination. Logging it into itself creates an endless log loop (AWS advises against it).
   count         = local.s3_access_logs ? 1 : 0
   bucket        = "${local.prefix}-s3-logs-${local.account_id}"
   force_destroy = true # access logs only; the data buckets themselves are kept
@@ -194,7 +212,6 @@ resource "aws_s3_bucket_policy" "access_logs" {
             "aws:SourceArn" = concat(
               [for b in aws_s3_bucket.dest : b.arn],
               [for b in aws_s3_bucket.velero : b.arn],
-              [aws_s3_bucket.access_logs[0].arn],
             )
           }
         }
@@ -203,15 +220,6 @@ resource "aws_s3_bucket_policy" "access_logs" {
   })
 
   depends_on = [aws_s3_bucket_public_access_block.access_logs, aws_s3_bucket_ownership_controls.access_logs]
-}
-
-resource "aws_s3_bucket_logging" "access_logs" {
-  count         = length(aws_s3_bucket.access_logs)
-  bucket        = aws_s3_bucket.access_logs[0].id
-  target_bucket = aws_s3_bucket.access_logs[0].id
-  target_prefix = "self/"
-
-  depends_on = [aws_s3_bucket_policy.access_logs]
 }
 
 resource "aws_s3_bucket_notification" "access_logs" {

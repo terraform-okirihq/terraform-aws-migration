@@ -83,6 +83,7 @@ resource "aws_s3_bucket_policy" "artifacts" {
 
 resource "aws_s3_bucket" "logs" {
   # checkov:skip=CKV_AWS_145: S3 server access log delivery does not support SSE-KMS
+  # checkov:skip=CKV_AWS_18: This is the log destination. Logging it into itself creates an endless log loop (AWS advises against it).
   bucket        = "${local.prefix}-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = true
   tags          = local.tags
@@ -160,7 +161,7 @@ resource "aws_s3_bucket_policy" "logs" {
         Resource  = "${aws_s3_bucket.logs.arn}/*"
         Condition = {
           StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
-          ArnLike      = { "aws:SourceArn" = [aws_s3_bucket.artifacts.arn, aws_s3_bucket.logs.arn] }
+          ArnLike      = { "aws:SourceArn" = [aws_s3_bucket.artifacts.arn] }
         }
       }
     ]
@@ -173,14 +174,6 @@ resource "aws_s3_bucket_logging" "artifacts" {
   bucket        = aws_s3_bucket.artifacts.id
   target_bucket = aws_s3_bucket.logs.id
   target_prefix = "artifacts/"
-
-  depends_on = [aws_s3_bucket_policy.logs]
-}
-
-resource "aws_s3_bucket_logging" "logs" {
-  bucket        = aws_s3_bucket.logs.id
-  target_bucket = aws_s3_bucket.logs.id
-  target_prefix = "self/"
 
   depends_on = [aws_s3_bucket_policy.logs]
 }

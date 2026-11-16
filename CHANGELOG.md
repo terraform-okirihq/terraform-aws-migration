@@ -1,8 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
-- MGN staging disks use the customer-managed key when the module has one.
+**Upgrade notes**
+
+- Production with `servers` now requires `servers.installer_principal_arns` (the IAM users or roles allowed to
+  assume the agent installer role). The plan stops with a message until it is set.
+- DMS security groups now open only each engine's default port. If a database listens elsewhere, set
+  `databases.<name>.source.port` / `target.port`, or DMS cannot connect.
+
+**Changes**
+
+- MGN staging disks use the customer-managed key when the module has one. The key policy lets MGN's
+  service-linked roles use it through EC2/EBS only, so replication can create encrypted staging disks.
+- Log buckets no longer write access logs into themselves (an endless log loop AWS advises against); the data
+  buckets still log to them.
 - DMS security groups allow only each engine's port (or `source.port` / `target.port`). HTTPS to the internet remains only when this module is not creating interface endpoints; DataSync egress is NFS 2049 or SMB 445.
 - Production requires `servers.installer_principal_arns` so the agent installer role is not assumable by every principal in the account.
 - The KMS key policy and the schema-conversion role require the caller's account. The schema-conversion bucket denies non-TLS access and enforces bucket-owner ownership.

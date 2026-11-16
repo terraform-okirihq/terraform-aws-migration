@@ -278,7 +278,7 @@ resource "aws_codebuild_project" "ci" {
     compute_type    = "BUILD_GENERAL1_SMALL"
     image           = "aws/codebuild/amazonlinux-x86_64-standard:5.0"
     type            = "LINUX_CONTAINER"
-    privileged_mode = true # docker build
+    privileged_mode = each.value.codebuild_privileged # true only when the buildspec runs the Docker daemon
   }
 
   logs_config {

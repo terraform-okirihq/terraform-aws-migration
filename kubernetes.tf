@@ -89,6 +89,27 @@ resource "aws_s3_bucket_policy" "velero" {
   depends_on = [aws_s3_bucket_public_access_block.velero]
 }
 
+resource "aws_s3_bucket_logging" "velero" {
+  count         = length(aws_s3_bucket.velero)
+  bucket        = aws_s3_bucket.velero[0].id
+  target_bucket = aws_s3_bucket.access_logs[0].id
+  target_prefix = "velero/"
+
+  depends_on = [aws_s3_bucket_policy.access_logs]
+}
+
+resource "aws_s3_bucket_notification" "velero" {
+  count  = length(aws_s3_bucket.velero)
+  bucket = aws_s3_bucket.velero[0].id
+
+  topic {
+    topic_arn = aws_sns_topic.alerts.arn
+    events    = ["s3:ObjectRemoved:*"]
+  }
+
+  depends_on = [aws_sns_topic_policy.alerts]
+}
+
 # --------------------------------------------
 # Velero permissions (same for both clusters)
 # --------------------------------------------
@@ -202,10 +223,21 @@ resource "aws_iam_user" "velero_source" {
   tags          = merge(local.tags, { Purpose = "Velero on the source cluster; delete after cutover" })
 }
 
-resource "aws_iam_user_policy_attachment" "velero_source" {
-  count      = length(aws_iam_user.velero_source)
-  user       = aws_iam_user.velero_source[0].name
+resource "aws_iam_group" "velero_source" {
+  count = length(aws_iam_user.velero_source)
+  name  = "${local.prefix}-velero-onprem"
+}
+
+resource "aws_iam_group_policy_attachment" "velero_source" {
+  count      = length(aws_iam_group.velero_source)
+  group      = aws_iam_group.velero_source[0].name
   policy_arn = aws_iam_policy.velero[0].arn
+}
+
+resource "aws_iam_user_group_membership" "velero_source" {
+  count  = length(aws_iam_user.velero_source)
+  user   = aws_iam_user.velero_source[0].name
+  groups = [aws_iam_group.velero_source[0].name]
 }
 
 resource "aws_iam_role" "velero_source" {

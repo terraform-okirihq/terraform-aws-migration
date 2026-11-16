@@ -293,6 +293,7 @@ resource "aws_dms_endpoint" "target" {
 }
 
 resource "aws_dms_s3_endpoint" "target" {
+  # checkov:skip=CKV_AWS_298: Object encryption is server_side_encryption_kms_key_id (SSE_KMS) when a CMK exists. kms_key_arn is deprecated and is omitted so this stays valid on AWS provider v6. Pilot has no CMK and uses SSE-S3.
   for_each = local.s3_targets
 
   endpoint_id             = "${local.prefix}-${each.key}-tgt"

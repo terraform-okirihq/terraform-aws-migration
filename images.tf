@@ -108,8 +108,22 @@ resource "aws_iam_role_policy" "ecr_templates" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = ["ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy"], Resource = "*" },
-      { Effect = "Allow", Action = ["kms:CreateGrant", "kms:DescribeKey", "kms:RetireGrant"], Resource = local.kms_key_arn },
+      {
+        Sid      = "CreatePrefixedRepositories"
+        Effect   = "Allow"
+        Action   = ["ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy"]
+        Resource = [for prefix in keys(local.pull_through) : "arn:${local.partition}:ecr:${local.region}:${local.account_id}:repository/${prefix}/*"]
+        Condition = {
+          StringEquals = { "aws:PrincipalAccount" = local.account_id }
+        }
+      },
+      {
+        Sid       = "EncryptWithMigrationKey"
+        Effect    = "Allow"
+        Action    = ["kms:CreateGrant", "kms:DescribeKey", "kms:RetireGrant"]
+        Resource  = local.kms_key_arn
+        Condition = { StringEquals = { "kms:ViaService" = "ecr.${local.region}.amazonaws.com" } }
+      },
     ]
   })
 }

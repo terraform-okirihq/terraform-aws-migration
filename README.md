@@ -151,7 +151,9 @@ Choose exactly one landing network:
 | Platform module | `target = { platform_name = "acme-prod" }` | You built it with `OkiriGabriel/platform/aws` |
 
 `network.create` builds public and private subnets in each AZ, NAT (`none`, `single` or `per_az`), free S3 and
-DynamoDB gateway endpoints, VPC flow logs and a locked default security group. With `interface_endpoints`
+DynamoDB gateway endpoints, VPC flow logs and a locked default security group. It uses the first `az_count`
+zones that do not require opt-in. Set `availability_zones` (for example `["us-east-1a", "us-east-1b"]`) to pin
+the names, so the subnets stay in the zones you listed. With `interface_endpoints`
 (default in production) it adds private endpoints for DMS, MGN, Secrets Manager, KMS, CloudWatch Logs, STS, SSM,
 EC2 and ECR, reachable from on-prem too, so migration traffic to AWS APIs never needs the internet.
 
@@ -246,7 +248,7 @@ file_shares = {
 | Behaviour | Detail |
 |:----------|:-------|
 | Sources | `nfs`, `smb`, `hdfs` (simple or Kerberos: principal, keytab and krb5.conf from Secrets Manager, QOP `PRIVACY` by default), `object-storage` (S3-compatible, HTTPS), `s3` (another account or region, no agent; `summary.files.<share>.source_bucket_policy` is the policy the source owner adds), `azure-blob` (SAS token) |
-| Destinations | `s3` (existing bucket, or one created with versioning, encryption, TLS-only policy, ACLs off), `efs` (TLS in transit), `fsx-windows` |
+| Destinations | `s3` (existing bucket, or one created with versioning, encryption, TLS-only policy, ACLs off, access logs, and a deletion alert), `efs` (TLS in transit), `fsx-windows` |
 | Transfers | Only changed data is copied; deleted files are preserved by default; verification defaults to `ONLY_FILES_TRANSFERRED` |
 | Bandwidth | `bandwidth_mbps` caps each task so business traffic keeps its share of the link |
 | Private connectivity | Production routes agents over a DataSync VPC endpoint (PrivateLink) instead of the internet |
@@ -332,8 +334,8 @@ The module creates an encrypted, TLS-only backup bucket with expiry, a least-pri
 access for both clusters without keys in Terraform state:
 
 - **EKS:** Pod Identity association (needs the `eks-pod-identity-agent` add-on) or an IRSA role bound to `velero/velero`.
-- **On-prem cluster:** IAM Roles Anywhere with a certificate from your CA, or an IAM user whose access key you
-  create from the printed command (the key never enters state; the user is removed with the stack).
+- **On-prem cluster:** IAM Roles Anywhere with a certificate from your CA, or an IAM user in its own group whose
+  access key you create from the printed command (the key never enters state; the user is removed with the stack).
 
 `summary.kubernetes` lists the exact `velero install`, `backup create`, `restore create` commands for each cluster,
 sets the EKS side read-only on the bucket, and gives the StorageClass-mapping ConfigMap for your storage classes.
@@ -362,7 +364,7 @@ pipelines = {
 | `gitlab` | OIDC (gitlab.com or your self-managed URL) | `project_path:<group/project>:ref_type:branch:ref:<branch>` |
 | `bitbucket`, `circleci`, `azure-devops` | OIDC with your workspace / org issuer | the `subjects` you give |
 | `jenkins` (TeamCity, Bamboo, any on-prem CI) | IAM Roles Anywhere: client certificate from your CA | certificate CN = pipeline key |
-| `codebuild` | AWS CodeBuild project on a CodeConnections link to GitHub / GitLab / Bitbucket | the project itself |
+| `codebuild` | AWS CodeBuild project on a CodeConnections link to GitHub / GitLab / Bitbucket. Privileged mode is off unless `codebuild_privileged = true` (a buildspec that runs the Docker daemon) | the project itself |
 
 Permissions are opt-in per pipeline: `ecr_push` (this module's repositories, plus `ecr_repositories`),
 `ecs_clusters` + `ecs_pass_roles`, `eks_clusters` (EKS access entry with the **edit** policy, scoped to

@@ -23,12 +23,21 @@ locals {
 # VPC
 # --------------------------------------------
 data "aws_availability_zones" "available" {
+  # checkov:skip=CKV_AWS_394: Subnet count is az_count, so a newly added zone does not create another subnet. Set network.availability_zones to pin the zone names.
   count = local.create_vpc ? 1 : 0
   state = "available"
 
   filter {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]
+  }
+
+  dynamic "filter" {
+    for_each = length(var.network.availability_zones) > 0 ? [var.network.availability_zones] : []
+    content {
+      name   = "zone-name"
+      values = filter.value
+    }
   }
 }
 

@@ -70,12 +70,14 @@ variable "network" {
     Build the landing network here (for teams with no AWS network yet). create = true gives a VPC with public and
     private subnets across az_count AZs, NAT, S3/DynamoDB gateway endpoints, flow logs and a locked default
     security group. interface_endpoints adds private endpoints for DMS, MGN, Secrets Manager, KMS, logs, STS,
-    SSM, EC2 and ECR (default: on in production).
+    SSM, EC2 and ECR (default: on in production). availability_zones pins the exact zone names (at least
+    az_count); leave it empty to take the first az_count zones that do not require opt-in.
   EOT
   type = object({
     create              = optional(bool, false)
     cidr                = optional(string, "10.100.0.0/16")
     az_count            = optional(number, 2)
+    availability_zones  = optional(list(string), [])
     nat                 = optional(string, "single") # none | single | per_az
     interface_endpoints = optional(bool)
   })
@@ -84,6 +86,11 @@ variable "network" {
   validation {
     condition     = contains(["none", "single", "per_az"], var.network.nat) && var.network.az_count >= 2 && var.network.az_count <= 4 && can(cidrhost(var.network.cidr, 0))
     error_message = "network.nat must be none, single or per_az; az_count 2-4; cidr a valid CIDR."
+  }
+
+  validation {
+    condition     = length(var.network.availability_zones) == 0 || length(var.network.availability_zones) >= var.network.az_count
+    error_message = "network.availability_zones must be empty, or list at least az_count zone names (for example [\"us-east-1a\", \"us-east-1b\"])."
   }
 }
 
@@ -145,7 +152,7 @@ variable "alert_email" {
 }
 
 variable "kms_key_arn" {
-  description = "Existing KMS key for DMS, logs, EBS staging disks and SNS. Null = create one (production) or use AWS-managed keys (pilot)."
+  description = "Existing KMS key for DMS, logs, EBS staging disks and SNS. Null = create one (production) or use AWS-managed keys (pilot). A key you bring yourself must allow s3.amazonaws.com to call kms:GenerateDataKey and kms:Decrypt from this account, so deletion alerts on the module's buckets can publish to the encrypted topic."
   type        = string
   default     = null
 }
@@ -522,16 +529,17 @@ variable "pipelines" {
     audience   = optional(string)
     subjects   = optional(list(string), [])
 
-    ecr_push           = optional(bool, true)       # this module's ECR repositories (+ ecr_repositories)
-    ecr_repositories   = optional(list(string), []) # extra repository names in this account
-    ecs_clusters       = optional(list(string), []) # cluster names it may deploy to
-    ecs_pass_roles     = optional(list(string), []) # task / execution role ARNs it may pass
-    eks_clusters       = optional(list(string), []) # cluster names it may deploy to
-    eks_namespaces     = optional(list(string), []) # [] = whole cluster (edit, not admin)
-    s3_buckets         = optional(list(string), []) # buckets it may sync to
-    policy_arns        = optional(list(string), []) # anything else
-    codebuild_repo_url = optional(string)           # codebuild: https://github.com/owner/repo (or GitLab / Bitbucket)
-    codebuild_source   = optional(string, "GITHUB") # codebuild: GITHUB | GITLAB | BITBUCKET
+    ecr_push             = optional(bool, true)       # this module's ECR repositories (+ ecr_repositories)
+    ecr_repositories     = optional(list(string), []) # extra repository names in this account
+    ecs_clusters         = optional(list(string), []) # cluster names it may deploy to
+    ecs_pass_roles       = optional(list(string), []) # task / execution role ARNs it may pass
+    eks_clusters         = optional(list(string), []) # cluster names it may deploy to
+    eks_namespaces       = optional(list(string), []) # [] = whole cluster (edit, not admin)
+    s3_buckets           = optional(list(string), []) # buckets it may sync to
+    policy_arns          = optional(list(string), []) # anything else
+    codebuild_repo_url   = optional(string)           # codebuild: https://github.com/owner/repo (or GitLab / Bitbucket)
+    codebuild_source     = optional(string, "GITHUB") # codebuild: GITHUB | GITLAB | BITBUCKET
+    codebuild_privileged = optional(bool, false)      # codebuild: true only when the buildspec runs the Docker daemon
   }))
   default = {}
 

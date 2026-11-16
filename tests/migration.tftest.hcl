@@ -221,6 +221,10 @@ run "mixed_estate_every_engine_share_and_os" {
     error_message = "4 shares, 1 new agent (dc2 existing), 2 module-created buckets (nfs, hdfs)"
   }
   assert {
+    condition     = aws_s3_bucket_logging.dest["exports"].target_prefix == "files/exports/" && contains(aws_s3_bucket_notification.dest["exports"].topic[0].events, "s3:ObjectRemoved:*") && length(aws_s3_bucket.access_logs) == 1
+    error_message = "module-created file buckets log to the access-log bucket and publish deletions to the alerts topic"
+  }
+  assert {
     condition     = aws_datasync_task.main["minio"].options[0].bytes_per_second == 25000000 && aws_datasync_task.main["profiles"].options[0].posix_permissions == "NONE"
     error_message = "bandwidth limit and SMB POSIX handling"
   }
@@ -456,8 +460,8 @@ run "images_kubernetes_and_every_ci_system" {
     error_message = "EKS deploy is namespace-scoped"
   }
   assert {
-    condition     = length(aws_codebuild_project.ci) == 1 && length(aws_rolesanywhere_profile.ci) == 1 && strcontains(output.summary.pipelines.gh.setup, "configure-aws-credentials")
-    error_message = "codebuild project, jenkins via Roles Anywhere, usage hints"
+    condition     = length(aws_codebuild_project.ci) == 1 && aws_codebuild_project.ci["cb"].environment[0].privileged_mode == false && length(aws_rolesanywhere_profile.ci) == 1 && strcontains(output.summary.pipelines.gh.setup, "configure-aws-credentials")
+    error_message = "codebuild project without a privileged Docker daemon, jenkins via Roles Anywhere, usage hints"
   }
 }
 
@@ -491,6 +495,21 @@ run "docker_hub_cache_needs_prefixed_secret" {
     images  = { pull_through = { hub = { upstream = "docker-hub", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:dockerhub-AbCdEf" } } }
   }
   expect_failures = [terraform_data.guardrails]
+}
+
+run "velero_onprem_user_is_in_a_group" {
+  command = apply
+
+  variables {
+    migrate    = ["kubernetes"]
+    target     = { vpc_id = "vpc-0123456789abcdef0", subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"] }
+    kubernetes = { target_cluster_name = "prod-eks" }
+  }
+
+  assert {
+    condition     = length(aws_iam_user.velero_source) == 1 && length(aws_iam_group_policy_attachment.velero_source) == 1 && length(aws_iam_user_group_membership.velero_source) == 1
+    error_message = "the on-prem Velero user gets its policy from a group"
+  }
 }
 
 run "kubernetes_needs_target_cluster" {
